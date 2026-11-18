@@ -133,12 +133,13 @@ struct DiskTile: View {
     let spark: [HistoryPoint]
     var body: some View {
         let d = s.disk
-        let low = d.freeInclPurgeableGB < d.floorGB * 1.25
+        let low = d.freeGB < d.floorGB * 1.25
         Tile(title: "Disk (internal)", source: sourceHelp(s, ["disk"]), json: { AnyEncodableBox(d) }) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(fmtGB(d.freeInclPurgeableGB)).font(.system(size: 22, weight: .bold, design: .rounded).monospacedDigit())
+                Text(fmtGB(d.freeGB)).font(.system(size: 22, weight: .bold, design: .rounded).monospacedDigit())
                     .foregroundStyle(low ? Palette.red : .primary)
-                Text("free").font(.caption).foregroundStyle(.secondary)
+                Text("free now").font(.caption).foregroundStyle(.secondary)
+                    .help("What df and statvfs report. Alerts, the floor and disk_free_gb use this figure.")
             }
             Group {
                 if let h = d.hoursToFloor {
@@ -151,9 +152,13 @@ struct DiskTile: View {
                 }
             }
             .font(.caption.monospacedDigit())
-            Text("purgeable \(fmtGB(d.purgeableGB))" + (d.tmLocalSnapshots.map { " · \($0) TM snapshot\($0 == 1 ? "" : "s")" } ?? ""))
+            Text("\(fmtGB(d.freeInclPurgeableGB)) incl. purgeable" + (d.tmLocalSnapshots.map { " · \($0) TM snapshot\($0 == 1 ? "" : "s")" } ?? ""))
                 .font(.caption).foregroundStyle(.secondary)
-                .help("Purgeable space includes caches and Time Machine local snapshots; macOS frees it when needed.")
+                .help("macOS' own estimate of what it could free (caches, Time Machine local snapshots); it may lag. Guards can use it as disk_free_purgeable_gb.")
+            if let st = d.lastStep {
+                Text(String(format: "%+.1f GB step at %@ left out of the trend", st.deltaGB, fmtTime(st.at)))
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
             Sparkline(points: spark, color: Palette.cream).equatable()
         }
     }

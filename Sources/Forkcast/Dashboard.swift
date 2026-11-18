@@ -86,7 +86,7 @@ struct CompactView: View {
                                     Dot(color: jobHealth(j, staleMinutes: snap.staleMinutes))
                                     Text("\(j.group)/\(j.name)").font(.caption.weight(.semibold)).lineLimit(1)
                                     Spacer()
-                                    Text(j.etaSeconds.map { "ETA \(fmtDuration($0))" } ?? j.state).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                                    Text(j.etaSeconds.map { "ETA \(fmtDuration($0))" } ?? j.displayState).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                                 }
                                 if let f = j.fraction { Bar(fraction: f, color: jobHealth(j, staleMinutes: snap.staleMinutes), height: 3) }
                             }
@@ -142,7 +142,7 @@ struct CompactHeader: View {
                 if let h = p.hoursToFull { Text("· full in ~\(fmtDuration(h * 3600))") }
                 if let h = p.hoursToEmpty { Text("· empty in ~\(fmtDuration(h * 3600))") }
                 Spacer()
-                Text(String(format: "%.1f/%d cores · mem %@ · disk %@", s.cpu.busyCores, s.cpu.totalCores, s.memory.pressure, fmtGB(s.disk.freeInclPurgeableGB)))
+                Text(String(format: "%.1f/%d cores · mem %@ · disk %@", s.cpu.busyCores, s.cpu.totalCores, s.memory.pressure, fmtGB(s.disk.freeGB)))
             }
             .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }

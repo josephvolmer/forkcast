@@ -47,7 +47,7 @@ struct AlertsColumn: View {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(alerts) { a in
                         HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: a.severity == "critical" ? "exclamationmark.octagon.fill" : "exclamationmark.triangle.fill")
+                            Image(systemName: a.severity == "critical" ? "exclamationmark.octagon.fill" : a.severity == "info" ? "info.circle" : "exclamationmark.triangle.fill")
                                 .foregroundStyle(severityColor(a.severity))
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(a.message).font(.system(size: 11.5)).fixedSize(horizontal: false, vertical: true)

@@ -19,6 +19,7 @@ final class SystemSensors {
     private(set) var cachedDisk = DiskInfo()
     private var diskCheckedAt = Date.distantPast
     private var tmCheckedAt = Date.distantPast
+    private var importantGB = 0.0
     private var volumeFree: [String: (free: Double, changed: Date)] = [:]
 
     init() {
@@ -120,23 +121,31 @@ final class SystemSensors {
 
     func disk(floorGB: Double, force: Bool = false) -> DiskInfo {
         let now = Date()
-        // Capacity incl. purgeable is relatively expensive: refresh once a minute.
-        if force || now.timeIntervalSince(diskCheckedAt) > 60 {
+        // Local snapshots: cheap enough every 2 min. A change in the count means purgeable space changed too.
+        var refresh = force
+        if now.timeIntervalSince(tmCheckedAt) > 120 {
+            tmCheckedAt = now
+            let n = Self.countLocalSnapshots()
+            if n != cachedDisk.tmLocalSnapshots { refresh = true }
+            cachedDisk.tmLocalSnapshots = n
+        }
+        // Free right now: statvfs, exactly what `df` and scripts' own guards see. Cheap, so every tick.
+        var vfs = statvfs()
+        if statvfs("/", &vfs) == 0 {
+            cachedDisk.freeGB = Double(vfs.f_bavail) * Double(vfs.f_frsize) / 1e9
+            cachedDisk.totalGB = Double(vfs.f_blocks) * Double(vfs.f_frsize) / 1e9
+        }
+        // macOS' "available for important usage" (incl. purgeable) is relatively expensive: once a minute.
+        if refresh || now.timeIntervalSince(diskCheckedAt) > 60 {
             diskCheckedAt = now
             let url = URL(fileURLWithPath: "/")
-            if let v = try? url.resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityKey,
-                                                          .volumeAvailableCapacityForImportantUsageKey]) {
-                cachedDisk.totalGB = Double(v.volumeTotalCapacity ?? 0) / 1e9
-                cachedDisk.freeGB = Double(v.volumeAvailableCapacity ?? 0) / 1e9
-                let important = Double(v.volumeAvailableCapacityForImportantUsage ?? 0) / 1e9
-                cachedDisk.freeInclPurgeableGB = max(important, cachedDisk.freeGB)
-                cachedDisk.purgeableGB = max(0, cachedDisk.freeInclPurgeableGB - cachedDisk.freeGB)
+            if let v = try? url.resourceValues(forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey]) {
+                if let t = v.volumeTotalCapacity, t > 0 { cachedDisk.totalGB = Double(t) / 1e9 }
+                importantGB = Double(v.volumeAvailableCapacityForImportantUsage ?? 0) / 1e9
             }
         }
-        if now.timeIntervalSince(tmCheckedAt) > 600 {
-            tmCheckedAt = now
-            cachedDisk.tmLocalSnapshots = Self.countLocalSnapshots()
-        }
+        cachedDisk.freeInclPurgeableGB = max(importantGB, cachedDisk.freeGB)
+        cachedDisk.purgeableGB = max(0, cachedDisk.freeInclPurgeableGB - cachedDisk.freeGB)
         cachedDisk.floorGB = floorGB
         var d = cachedDisk
         // Block-device byte counters (all drives).

@@ -64,6 +64,9 @@ final class Engine {
     private var todayUpMB = 0.0
     private var trendsAt = Date.distantPast
     private var diskTrend: Double?
+    private var diskStep: DiskStep?
+    private var diskSeriesStart: Int64 = 0           // first minute where disk_free_gb means "free now" (statvfs)
+    private var diskSamples: [(t: Date, free: Double, purgeable: Double, snapshots: Int?)] = []   // one per minute, 90 min
     private var swapTrend: Double?
     private var netTop: (String, Double)?
     private var netTopAt = Date.distantPast
@@ -82,11 +85,16 @@ final class Engine {
     private var foreignRunning = false
 
     // Long-polling waits.
-    private struct Waiter { let id: UUID; let expr: Expr; let deadline: Date; let started: Date; let done: (WaitResult) -> Void }
+    private struct Waiter { let id: UUID; let expr: Expr; let deadline: Date; let started: Date; let notBefore: Date; let done: (WaitResult) -> Void }
     private var waiters: [Waiter] = []
     private var waitTimer: DispatchSourceTimer?
 
     init() {
+        if let v = store.get("diskSeriesV2Start").flatMap(Int64.init) { diskSeriesStart = v }
+        else {
+            diskSeriesStart = Int64(Date().timeIntervalSince1970 / 60) + 1
+            store.set("diskSeriesV2Start", String(diskSeriesStart))
+        }
         if let s = store.get("paused"), let d = try? JSON.decoder.decode([String: PauseRecord].self, from: Data(s.utf8)) { paused = d }
     }
 
@@ -98,7 +106,7 @@ final class Engine {
             self.recordBoot()
             self.loadToday()
             self.recentEvents = self.store.events(since: Date().addingTimeInterval(-7 * 86400), limit: 200)
-            self.crashes.onReport = { [weak self] path, name, pid in self?.crashReport(path: path, name: name, pid: pid) }
+            self.crashes.onReport = { [weak self] r in self?.crashReport(r) }
             self.crashes.start(queue: self.queue)
             // Priming sample: rates need two samples, so publish nothing until a real interval has passed.
             self.table.sample()
@@ -250,7 +258,7 @@ final class Engine {
                              staleMinutes: cfg.alerts.jobStaleMinutes, now: now) {
             event(e.type, e.subject, e.message)
             if cfg.alerts.jobEnded, ["job.finished", "job.failed", "job.exited"].contains(e.type) {
-                deliver(alerts.raise("job_ended", e.subject, e.message, severity: e.type == "job.failed" ? "critical" : "warning"))
+                deliver(alerts.raise("job_ended", e.subject, e.message, severity: Self.endSeverity(e.type)))
             }
         }
 
@@ -285,16 +293,35 @@ final class Engine {
         net.topProcess = netTop?.0
         net.topProcessMBs = netTop?.1
 
-        // Trends from history (every 5 min).
+        // Trends from history (every 5 min). One-off steps in free space are events, not part of the rate.
         if now.timeIntervalSince(trendsAt) > 300 {
             trendsAt = now
             let to = Int64(now.timeIntervalSince1970 / 60)
-            diskTrend = slopePerHour(store.series(.disk_free_gb, fromMinute: to - 120, toMinute: to, stepMinutes: 5))
+            let (trend, step) = Self.trendExcludingSteps(store.series(.disk_free_gb, fromMinute: max(to - 120, diskSeriesStart),
+                                                                      toMinute: to, stepMinutes: 5))
+            diskTrend = trend
+            if let st = step, st.at != diskStep?.at {
+                let key = String(Int(st.at.timeIntervalSince1970))
+                if store.get("lastDiskStep") != key {
+                    store.set("lastDiskStep", key)
+                    let t = DateFormatter.localizedString(from: st.at, dateStyle: .none, timeStyle: .short)
+                    event("disk.step", "/", String(format: "Free space %@ %.1f GB around %@ (%@): a one-off, left out of the disk trend",
+                                                   st.deltaGB > 0 ? "jumped +" : "dropped", abs(st.deltaGB), t,
+                                                   st.deltaGB > 0 ? "a cleanup, snapshot thinning or a deleted folder" : "a big copy or download"))
+                }
+            }
+            diskStep = step
             swapTrend = slopePerHour(store.series(.swap_gb, fromMinute: to - 60, toMinute: to, stepMinutes: 5))
         }
         disk.trendGBPerHour = diskTrend
+        disk.lastStep = diskStep
         if let t = diskTrend, t < -0.05 {
-            disk.hoursToFloor = max(0, (disk.freeInclPurgeableGB - disk.floorGB) / -t)
+            disk.hoursToFloor = max(0, (disk.freeGB - disk.floorGB) / -t)
+        }
+        // Deletes that don't free space (Time Machine local snapshots holding the data), sampled once a minute.
+        if diskSamples.last.map({ now.timeIntervalSince($0.t) >= 60 }) ?? true {
+            diskSamples.append((now, disk.freeGB, disk.purgeableGB, disk.tmLocalSnapshots))
+            diskSamples.removeAll { now.timeIntervalSince($0.t) > 5400 }
         }
         mem.swapGrowthGBPerHour = swapTrend
         // Top disk I/O process.
@@ -304,7 +331,8 @@ final class Engine {
             disk.topIOMBs = (top.readBytes + top.writeBytes) / table.seconds / 1e6
         }
 
-        headroom.record(busyCores: cpu.busyCores, groups: result.groups, diskMBs: disk.readMBs + disk.writeMBs, now: now)
+        let waiting = jobs.waitingJobs
+        headroom.record(busyCores: cpu.busyCores, groups: result.groups, diskMBs: disk.readMBs + disk.writeMBs, waiting: waiting, now: now)
         cpu.freeCoresP90 = headroom.freeCoresP90(total: cpu.totalCores)
         disk.ioPeakMBs = headroom.ioPeakMBs
         for e in headroom.throughputEvents(jobs: jobs, now: now) { event(e.type, e.subject, e.message) }
@@ -334,7 +362,7 @@ final class Engine {
         s.monitor.memMB = result.selfMem
         s.monitor.watts = result.selfW
         s.monitor.intervalS = interval
-        s.headroom = headroom.compute(cpu: cpu, mem: mem, power: power, disk: disk, groups: result.groups, now: now)
+        s.headroom = headroom.compute(cpu: cpu, mem: mem, power: power, disk: disk, groups: result.groups, waiting: waiting, now: now)
         s.sources = [
             "power.cpu": SourceStamp(energy.available ? "IOReport Energy Model (CPU/GPU/ANE/DRAM)" : "unavailable", now),
             "power.battery": SourceStamp("AppleSmartBattery via IOKit (PowerTelemetryData, Voltage × Amperage)", now),
@@ -342,7 +370,7 @@ final class Engine {
             "processes.other_users": SourceStamp("/bin/ps (setuid) for other users' processes, every 15–60 s", foreignAt),
             "cpu": SourceStamp("host_processor_info per-core ticks · ProcessInfo.thermalState", now),
             "memory": SourceStamp("host_statistics64 · kern.memorystatus_vm_pressure_level · vm.swapusage", now),
-            "disk": SourceStamp("URL volume capacities (refreshed every 60 s) · tmutil every 10 min", now),
+            "disk": SourceStamp("free now: statvfs(\"/\") like df · incl. purgeable: macOS' volumeAvailableCapacityForImportantUsage estimate (60 s) · tmutil listlocalsnapshots every 2 min", now),
             "disk.io": SourceStamp("IOBlockStorageDriver statistics · per-process rusage disk I/O", now),
             "network": SourceStamp("sysctl NET_RT_IFLIST2 (en* interfaces)", now),
             "network.top": SourceStamp("nettop (only while the dashboard is open or the API is in use)", netTopAt),
@@ -350,7 +378,11 @@ final class Engine {
 
         // Alerts (need the status) and guards (need the expression context).
         let ctx = Context(status: s, engine: self)
-        let out = alerts.evaluate(s, groups: result.groups, cfg: cfg.alerts, now: now)
+        var extras = AlertEngine.Extras()
+        extras.waitingJobs = waiting
+        extras.unplugNote = batteryGuardNote(power, guards: cfg.guards)
+        extras.snapshotHold = snapshotHold(disk, folders: s.folders, now: now)
+        let out = alerts.evaluate(s, groups: result.groups, cfg: cfg.alerts, extras: extras, now: now)
         for e in out.events { event(e.type, e.subject, e.message) }
         for a in out.fired { deliver(a) }
         for a in out.cleared { event("alert.cleared", a.subject, "Cleared: \(a.message)") }
@@ -452,7 +484,7 @@ final class Engine {
         gauge(.mem_used_gb, s.memory.usedGB)
         gauge(.swap_gb, s.memory.swapUsedGB)
         gauge(.compressed_gb, s.memory.compressedGB)
-        gauge(.disk_free_gb, s.disk.freeInclPurgeableGB > 0 ? s.disk.freeInclPurgeableGB : nil)
+        gauge(.disk_free_gb, s.disk.freeGB > 0 ? s.disk.freeGB : nil)
         counter(.disk_read_mb, s.disk.readMBs * dt)
         counter(.disk_write_mb, s.disk.writeMBs * dt)
         counter(.net_down_mb, s.network.downMBs * dt)
@@ -485,7 +517,32 @@ final class Engine {
         if now.timeIntervalSince(lastPrune) > 6 * 3600 { store.prune(now: now); lastPrune = now }
     }
 
-    private func slopePerHour(_ pts: [HistoryPoint]) -> Double? {
+
+    /// Linear trend (GB/h) of a 5-minute series after removing one-off steps (a jump far larger than the
+    /// usual change between buckets). Returns the most recent step, if any.
+    static func trendExcludingSteps(_ pts: [HistoryPoint]) -> (Double?, DiskStep?) {
+        let xs = pts.compactMap { p in p.v.map { (p.t, $0) } }
+        guard xs.count >= 2 else { return (nil, nil) }
+        let deltas = zip(xs.dropFirst(), xs).map { $0.1 - $1.1 }
+        let sortedAbs = deltas.map(abs).sorted()
+        let median = sortedAbs[sortedAbs.count / 2]
+        let threshold = max(3.0, median * 6)
+        var offset = 0.0
+        var adjusted: [HistoryPoint] = [HistoryPoint(t: xs[0].0, v: xs[0].1)]
+        var step: DiskStep?
+        for (i, d) in deltas.enumerated() {
+            if abs(d) > threshold {
+                offset += d
+                step = DiskStep(at: xs[i + 1].0, deltaGB: d)
+            }
+            adjusted.append(HistoryPoint(t: xs[i + 1].0, v: xs[i + 1].1 - offset))
+        }
+        return (slopePerHourStatic(adjusted), step)
+    }
+
+    private func slopePerHour(_ pts: [HistoryPoint]) -> Double? { Self.slopePerHourStatic(pts) }
+
+    static func slopePerHourStatic(_ pts: [HistoryPoint]) -> Double? {
         let xs = pts.compactMap { p in p.v.map { (p.t.timeIntervalSince1970 / 3600, $0) } }
         guard xs.count >= 4, let first = xs.first, let last = xs.last, last.0 - first.0 > 0.25 else { return nil }
         let mx = xs.map(\.0).reduce(0, +) / Double(xs.count)
@@ -493,6 +550,76 @@ final class Engine {
         let num = xs.map { ($0.0 - mx) * ($0.1 - my) }.reduce(0, +)
         let den = xs.map { ($0.0 - mx) * ($0.0 - mx) }.reduce(0, +)
         return den > 0 ? num / den : nil
+    }
+
+    /// "the battery guard (<10%) pauses renders in ~2h45m" for pause guards with a `battery < X` condition.
+    private func batteryGuardNote(_ p: PowerInfo, guards rules: [GuardRule]) -> String? {
+        guard !p.onAC, let pct = p.batteryPct, let draw = p.drawW, draw > 0.5 else { return nil }
+        func thresholds(_ e: Expr) -> [Double] {
+            switch e {
+            case let .compare("battery", op, v) where op == "<" || op == "<=": return [v]
+            case let .and(a, b), let .or(a, b): return thresholds(a) + thresholds(b)
+            default: return []
+            }
+        }
+        var byThreshold: [Double: (names: [String], groups: [String])] = [:]
+        for r in rules where (r.enabled ?? true) && r.action == "pause" {
+            guard let e = try? ExprParser.parse(r.when), let x = thresholds(e).max(), Double(pct) > x else { continue }
+            var cur = byThreshold[x] ?? ([], [])
+            cur.names.append(r.name)
+            if let g = r.group { cur.groups.append(g) }
+            byThreshold[x] = cur
+        }
+        guard !byThreshold.isEmpty else { return nil }
+        let parts = byThreshold.keys.sorted(by: >).map { x -> String in
+            let v = byThreshold[x]!
+            let hours: Double
+            if let wh = p.batteryWh, let full = p.batteryFullWh, full > 0 {
+                hours = max(0, wh - full * x / 100) / draw
+            } else if let h = p.hoursToEmpty, pct > 0 {
+                hours = h * (Double(pct) - x) / Double(pct)
+            } else { return "" }
+            let who = v.names.count == 1 ? "the \(v.names[0]) guard" : "guards \(v.names.joined(separator: ", "))"
+            let groups = v.groups.isEmpty ? "its jobs" : Self.listText(Array(Set(v.groups)).sorted())
+            return "\(who) (<\(Expr.fmt(x))%) pauses \(groups) in ~\(fmtDuration(hours * 3600))"
+        }.filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: "; ")
+    }
+
+    static func listText(_ xs: [String]) -> String {
+        xs.count <= 1 ? (xs.first ?? "") : xs.dropLast().joined(separator: ", ") + " and " + xs.last!
+    }
+
+    /// Big deletes in the last hour that didn't raise free space, while local snapshots exist.
+    /// "Deleted" comes from purgeable space growing (snapshot-held data becomes purgeable) and from
+    /// watched folders shrinking; whichever is larger.
+    private func snapshotHold(_ d: DiskInfo, folders: [FolderInfo], now: Date) -> AlertEngine.SnapshotHold? {
+        guard let snaps = d.tmLocalSnapshots, snaps > 0,
+              let old = diskSamples.first(where: { now.timeIntervalSince($0.t) <= 3900 }),
+              now.timeIntervalSince(old.t) >= 1800 else { return nil }
+        let freeChange = d.freeGB - old.free
+        let purgeableGrowth = d.purgeableGB - old.purgeable
+        var shrink = 0.0
+        for f in configStore.config.watchedFolders {
+            let h = store.folderHistory(path: f, since: now.addingTimeInterval(-3900))
+            if let a = h.first, let b = h.last, a.1 > b.1 { shrink += a.1 - b.1 }
+        }
+        let deleted = max(purgeableGrowth, shrink)
+        guard deleted >= 10, freeChange < deleted * 0.25 else { return nil }
+        let mins = Int(now.timeIntervalSince(old.t) / 60)
+        var basis = [String(format: "free %.1f → %.1f GB over %d min", old.free, d.freeGB, mins)]
+        if purgeableGrowth > 1 { basis.append(String(format: "purgeable +%.1f GB", purgeableGrowth)) }
+        if shrink > 1 { basis.append(String(format: "watched folders −%.1f GB", shrink)) }
+        if let o = old.snapshots, o != snaps { basis.append("snapshots \(o) → \(snaps)") }
+        return AlertEngine.SnapshotHold(deletedGB: deleted, freeChangeGB: freeChange, snapshots: snaps, basis: basis.joined(separator: ", "))
+    }
+
+    static func endSeverity(_ type: String) -> String {
+        switch type {
+        case "job.failed": return "critical"
+        case "job.finished", "job.exited": return "info"     // ended normally, or exit code unknowable
+        default: return "warning"
+        }
     }
 
     private func scanFolders(_ paths: [String]) {
@@ -537,22 +664,34 @@ final class Engine {
         DispatchQueue.main.async { Delivery.send(a, cfg: cfg) }
     }
 
-    private func crashReport(path: String, name: String, pid: Int32?) {
-        let fname = (path as NSString).lastPathComponent
-        event("crash", name, "Crash report: \(name)" + (pid.map { " (pid \($0))" } ?? "") + " — \(fname)")
-        guard configStore.config.alerts.crashReports else { return }
-        var matched = false
-        if let pid, let e = jobs.markCrashed(pid: pid, report: path) {
-            event(e.type, e.subject, e.message)
-            matched = true
+    /// Crash reports are attributed to the registered job (or job group) whose process tree contains the
+    /// crashed process or any of its ancestors, e.g. "crash in presets2 (headless-daw, faulting module HeartCore)".
+    private func crashReport(_ c: CrashWatcher.Report) {
+        let fname = (c.path as NSString).lastPathComponent
+        var detail = [c.name]
+        if let m = c.faultingModule { detail.append("faulting module \(m)") }
+        if let e = c.exception, !e.isEmpty { detail.append(e) }
+        let summary = detail.joined(separator: ", ")
+        // The crashed pid is usually gone already: use the parent pid from the report, then live ancestors.
+        var chain: [Int32] = [c.pid, c.parentPid].compactMap { $0 }
+        var cur = c.parentPid ?? c.pid
+        for _ in 0..<12 {
+            guard let p = cur, let e = table.entries[p], e.ppid > 1 else { break }
+            chain.append(e.ppid)
+            cur = e.ppid
         }
-        if !matched, let pid, let r = lastResult,
-           let g = r.groups.first(where: { ($0.kind == "job" || $0.kind == "registered") && (r.members[$0.id] ?? []).contains(pid) }) {
-            matched = true
-            deliver(alerts.raise("crash", g.label, "\(name) crashed in \(g.label) (\(fname))", severity: "critical"))
+        let pidText = c.pid.map { " (pid \($0)\(c.parentPid.map { ", parent \($0)\(c.parentName.map { " \($0)" } ?? "")" } ?? ""))" } ?? ""
+        event("crash", c.name, "Crash report: \(summary)\(pidText) — \(fname)")
+        guard configStore.config.alerts.crashReports else { return }
+        if let job = jobs.jobContaining(chain) {
+            if let e = jobs.markCrashed(job: job, pid: c.pid ?? -1, summary: summary) { event(e.type, e.subject, e.message) }
+            deliver(alerts.raise("crash", job, "crash in \(job) (\(summary))", severity: "critical"))
             return
         }
-        if matched { deliver(alerts.raise("crash", name, "\(name) crashed (\(fname))", severity: "critical")) }
+        if let r = lastResult,
+           let g = r.groups.first(where: { g in (g.kind == "job" || g.kind == "registered") && chain.contains { (r.members[g.id] ?? []).contains($0) } }) {
+            deliver(alerts.raise("crash", g.label, "crash in \(g.label) (\(summary))", severity: "critical"))
+        }
     }
 
     // MARK: Pause / resume
@@ -622,7 +761,11 @@ final class Engine {
         do { expr = try ExprParser.parse(exprString) } catch let e as ExprError { done(.failure(e)); return } catch { return }
         queue.async {
             self.apiDemandAt = Date()
-            let w = Waiter(id: UUID(), expr: expr, deadline: Date().addingTimeInterval(timeout), started: Date()) { done(.success($0)) }
+            // Job conditions get a short grace: a client that just started a new run under the same name
+            // (`forkcast run … &` then `forkcast wait 'job X done'`) may not have registered it yet.
+            let now = Date()
+            let w = Waiter(id: UUID(), expr: expr, deadline: now.addingTimeInterval(timeout), started: now,
+                           notBefore: now.addingTimeInterval(expr.mentionsJob ? 3 : 0)) { done(.success($0)) }
             self.waiters.append(w)
             self.evaluateWaits()
             if !self.waiters.isEmpty {
@@ -643,6 +786,7 @@ final class Engine {
         let ctx = Context(status: latestStatus, engine: self)
         let now = Date()
         waiters.removeAll { w in
+            if now < w.notBefore && now < w.deadline { return false }
             let (ok, why) = w.expr.evaluate(ctx)
             if ok || now >= w.deadline {
                 w.done(WaitResult(met: ok, timedOut: !ok, fired: why, waitedSeconds: now.timeIntervalSince(w.started), status: latestStatus))
@@ -685,7 +829,8 @@ final class Engine {
             case "mem_headroom_gb": return s.memory.headroomGB
             case "swap_gb": return s.memory.swapUsedGB
             case "swap_growth_gb_h": return s.memory.swapGrowthGBPerHour ?? 0
-            case "disk_free_gb": return s.disk.freeInclPurgeableGB
+            case "disk_free_gb": return s.disk.freeGB
+            case "disk_free_purgeable_gb": return s.disk.freeInclPurgeableGB
             case "disk_hours_to_floor": return s.disk.hoursToFloor ?? .infinity
             case "disk_read_mbs": return s.disk.readMBs
             case "disk_write_mbs": return s.disk.writeMBs
@@ -759,11 +904,18 @@ final class Engine {
     func beat(_ name: String) throws -> JobInfo { try sync { try jobs.beat(name) } }
     func exitJob(_ name: String, _ e: ExitRequest) throws -> JobInfo {
         try sync {
-            let (info, ev) = try jobs.exit(name, e)
+            let (info, ev, current) = try jobs.exit(name, e)
             event(ev.type, ev.subject, ev.message)
-            if configStore.config.alerts.jobEnded {
-                deliver(alerts.raise("job_ended", name, ev.message, severity: ev.type == "job.failed" ? "critical" : "warning"))
+            if current, configStore.config.alerts.jobEnded {
+                deliver(alerts.raise("job_ended", name, ev.message, severity: Self.endSeverity(ev.type)))
             }
+            return info
+        }
+    }
+    func setJobState(_ name: String, _ r: StateRequest) throws -> JobInfo {
+        try sync {
+            let (info, ev) = try jobs.setState(name, r)
+            event(ev.type, ev.subject, ev.message)
             return info
         }
     }

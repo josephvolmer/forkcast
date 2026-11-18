@@ -22,7 +22,15 @@ final class AlertEngine {
         [g.label, g.jobName, g.registeredGroup, g.kindKey, g.id].compactMap { $0?.lowercased() }
     }
 
-    func evaluate(_ s: Status, groups: [GroupInfo], cfg: AlertConfig, now: Date) -> Output {
+    /// Extra inputs computed by the engine.
+    struct Extras {
+        var unplugNote: String? = nil          // e.g. "the battery guard (<10%) pauses renders in ~2h45m"
+        var snapshotHold: SnapshotHold? = nil  // deletes that didn't free space
+        var waitingJobs: Set<String> = []
+    }
+    struct SnapshotHold { var deletedGB: Double; var freeChangeGB: Double; var snapshots: Int; var basis: String }
+
+    func evaluate(_ s: Status, groups: [GroupInfo], cfg: AlertConfig, extras: Extras = Extras(), now: Date) -> Output {
         var out = Output()
         var seen = Set<String>()
 
@@ -58,7 +66,12 @@ final class AlertEngine {
         let p = s.power
         // Charger plugged / unplugged / wattage change (always on the timeline; alerts if enabled).
         if let was = lastOnAC, was != p.onAC {
-            let msg = p.onAC ? "Charger connected (\(p.chargerW.map { "\(Int($0)) W" } ?? "?"))" : "Charger unplugged — on battery at \(p.batteryPct ?? 0)%"
+            var msg = p.onAC ? "Charger connected (\(p.chargerW.map { "\(Int($0)) W" } ?? "?"))" : "Charger unplugged — on battery at \(p.batteryPct ?? 0)%"
+            if !p.onAC {
+                if let d = p.drawW { msg += String(format: ", %.1f W draw", d) }
+                if let n = extras.unplugNote { msg += ": " + n }
+                else if let h = p.hoursToEmpty { msg += " (~\(fmtDuration(h * 3600)) to empty)" }
+            }
             out.events.append(JobEvent(type: p.onAC ? "power.plugged" : "power.unplugged", subject: p.chargerName, message: msg))
             if cfg.chargerChange && !p.onAC { instant("charger_unplugged", nil, msg) }
         } else if p.onAC, let w = p.chargerW, let lw = lastChargerW, abs(w - lw) >= 1 {
@@ -84,12 +97,17 @@ final class AlertEngine {
             }
         }
         if let x = cfg.diskFreeMinGB {
-            hold("disk_free", "/", s.disk.freeInclPurgeableGB > 0 && s.disk.freeInclPurgeableGB < x, minutes: 0, severity: "critical",
-                 "Only \(Int(s.disk.freeInclPurgeableGB)) GB free on the internal disk")
+            hold("disk_free", "/", s.disk.freeGB > 0 && s.disk.freeGB < x, minutes: 0, severity: "critical",
+                 "Only \(Int(s.disk.freeGB)) GB free now on the internal disk (\(Int(s.disk.freeInclPurgeableGB)) GB incl. purgeable)")
         }
         if let h = cfg.diskHoursToFloorMin {
             hold("disk_floor", "/", (s.disk.hoursToFloor ?? .infinity) < h, minutes: 0,
                  "Disk reaches the \(Int(s.disk.floorGB)) GB floor in ~\(fmtDuration((s.disk.hoursToFloor ?? 0) * 3600)) (\(String(format: "%.1f", s.disk.trendGBPerHour ?? 0)) GB/h)")
+        }
+        if cfg.snapshotHold {
+            let h = extras.snapshotHold
+            hold("disk_snapshots", "/", h != nil, minutes: 0,
+                 h.map { "~\(Int($0.deletedGB)) GB deleted in the last hour but free space \($0.freeChangeGB >= 0 ? "rose only" : "fell") \(String(format: "%+.1f", $0.freeChangeGB)) GB; \($0.snapshots) Time Machine local snapshot\($0.snapshots == 1 ? " is" : "s are") holding it (free it with `tmutil thinlocalsnapshots / 999999999999 4`). Basis: \($0.basis)" } ?? "")
         }
         if let m = cfg.memoryRedMinutes {
             hold("memory_red", nil, s.memory.pressure == "red", minutes: m, severity: "critical",
@@ -115,7 +133,7 @@ final class AlertEngine {
 
         // Jobs: stale while stale.
         for j in s.jobs {
-            hold("job_stale", j.name, j.state == "stale", minutes: 0,
+            hold("job_stale", j.name, j.state == "stale" && !extras.waitingJobs.contains(j.name), minutes: 0,
                  "\(j.name): no progress or log output for \(fmtDuration(j.secondsSinceActivity ?? 0))")
         }
 
@@ -131,7 +149,10 @@ final class AlertEngine {
                 hold("cpu_range", g.label, low || high, minutes: r.minutes,
                      low ? "\(g.label) at \(Int(g.cpuPct))% CPU, below its expected \(Int(r.minCPU ?? 0))% for \(Int(r.minutes)) min — hung?"
                          : "\(g.label) at \(Int(g.cpuPct))% CPU, above its expected \(Int(r.maxCPU ?? 0))%")
-            } else if cfg.cpu.enabled && !names.contains(where: muted.contains) {
+            } else if cfg.cpu.enabled && !names.contains(where: muted.contains)
+                        && (g.kind != "registered" || cfg.cpu.registeredJobs) {
+                // Registered jobs are expected to use CPU: no high-CPU alerts unless they declare a range
+                // (alerts.expectedCPU) or alerts.cpu.registeredJobs is true.
                 hold("cpu", g.label, g.cpuPct >= cfg.cpu.percent, minutes: cfg.cpu.minutes,
                      "\(g.label) has used \(Int(g.cpuPct))% CPU for \(Int(cfg.cpu.minutes))+ min")
             }
@@ -287,7 +308,7 @@ final class CrashWatcher {
     private var source: DispatchSourceFileSystemObject?
     private var seen = Set<String>()
     private let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/DiagnosticReports")
-    var onReport: ((String, String, Int32?) -> Void)?   // path, process name, pid
+    var onReport: ((Report) -> Void)?
 
     func start(queue: DispatchQueue) {
         seen = Set((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
@@ -304,20 +325,76 @@ final class CrashWatcher {
         let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
         for f in files where !seen.contains(f) {
             seen.insert(f)
-            guard f.hasSuffix(".ips") || f.hasSuffix(".crash") else { continue }
+            // Dot-files are temp copies written before the final rename: the real report follows.
+            guard !f.hasPrefix("."), f.hasSuffix(".ips") || f.hasSuffix(".crash") else { continue }
             let path = dir.appendingPathComponent(f).path
             guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
-            var name = (f as NSString).deletingPathExtension
-            if let firstLine = text.split(separator: "\n").first,
-               let obj = try? JSONSerialization.jsonObject(with: Data(firstLine.utf8)) as? [String: Any] {
-                name = (obj["name"] as? String) ?? (obj["app_name"] as? String) ?? name
-            }
-            var pid: Int32?
-            if let re = try? NSRegularExpression(pattern: "\"pid\"\\s*:\\s*(\\d+)"),
-               let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-               let r = Range(m.range(at: 1), in: text) { pid = Int32(text[r]) }
-            onReport?(path, name, pid)
+            onReport?(Self.parse(text, path: path))
         }
+    }
+
+    struct Report {
+        var path: String
+        var name: String
+        var pid: Int32?
+        var parentPid: Int32?
+        var parentName: String?
+        var faultingModule: String?   // first non-system image in the crashing thread's top frames
+        var exception: String?        // e.g. EXC_BAD_ACCESS (SIGSEGV)
+    }
+
+    /// .ips: a one-line JSON header followed by a JSON body (macOS 12+). Older .crash files are plain text.
+    static func parse(_ text: String, path: String) -> Report {
+        var r = Report(path: path, name: ((path as NSString).lastPathComponent as NSString).deletingPathExtension)
+        let parts = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        if let first = parts.first, let head = try? JSONSerialization.jsonObject(with: Data(first.utf8)) as? [String: Any] {
+            r.name = (head["name"] as? String) ?? (head["app_name"] as? String) ?? r.name
+        }
+        if parts.count > 1, let body = try? JSONSerialization.jsonObject(with: Data(parts[1].utf8)) as? [String: Any] {
+            r.name = (body["procName"] as? String) ?? r.name
+            r.pid = (body["pid"] as? NSNumber)?.int32Value
+            r.parentPid = (body["parentPid"] as? NSNumber)?.int32Value
+            r.parentName = body["parentProc"] as? String
+            if let ex = body["exception"] as? [String: Any] {
+                r.exception = [ex["type"] as? String, (ex["signal"] as? String).map { "(\($0))" }].compactMap { $0 }.joined(separator: " ")
+            }
+            let images = (body["usedImages"] as? [[String: Any]]) ?? []
+            let threads = (body["threads"] as? [[String: Any]]) ?? []
+            let idx = (body["faultingThread"] as? Int) ?? threads.firstIndex { ($0["triggered"] as? Bool) == true }
+            if let i = idx, i < threads.count, let frames = threads[i]["frames"] as? [[String: Any]] {
+                func image(_ f: [String: Any]) -> (String, String)? {
+                    guard let ii = f["imageIndex"] as? Int, ii >= 0, ii < images.count else { return nil }
+                    let im = images[ii]
+                    let p = (im["path"] as? String) ?? ""
+                    return ((im["name"] as? String) ?? (p as NSString).lastPathComponent, p)
+                }
+                let top = frames.prefix(8).compactMap(image)
+                let isSystem = { (p: String) in p.hasPrefix("/System/") || p.hasPrefix("/usr/lib/") }
+                r.faultingModule = top.first { !isSystem($0.1) }?.0 ?? top.first?.0
+            }
+        } else {
+            func field(_ k: String) -> String? {
+                guard let re = try? NSRegularExpression(pattern: "^" + k + ":\\s*(.+)$", options: .anchorsMatchLines),
+                      let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                      let rg = Range(m.range(at: 1), in: text) else { return nil }
+                return String(text[rg]).trimmingCharacters(in: .whitespaces)
+            }
+            if let p = field("Process") {   // "headless-daw [4242]"
+                let bits = p.split(separator: "[")
+                r.name = bits.first.map { $0.trimmingCharacters(in: .whitespaces) } ?? r.name
+                r.pid = bits.count > 1 ? Int32(bits[1].filter(\.isNumber)) : nil
+            }
+            if let p = field("Parent Process") {
+                let bits = p.split(separator: "[")
+                r.parentName = bits.first.map { $0.trimmingCharacters(in: .whitespaces) }
+                r.parentPid = bits.count > 1 ? Int32(bits[1].filter(\.isNumber)) : nil
+            }
+            r.exception = field("Exception Type")
+        }
+        if r.pid == nil, let re = try? NSRegularExpression(pattern: "\"pid\"\\s*:\\s*(\\d+)"),
+           let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+           let rg = Range(m.range(at: 1), in: text) { r.pid = Int32(text[rg]) }
+        return r
     }
 }
 
@@ -356,6 +433,7 @@ enum Delivery {
         case "charger_changed": return "Charger changed"
         case "battery_low": return "Battery low"
         case "disk_free", "disk_floor": return "Disk filling up"
+        case "disk_snapshots": return "Deleting files isn't freeing space"
         case "memory_red", "swap_growth": return "Memory under pressure"
         case "throttling": return "Mac is throttling"
         case "volume_unmounted": return "Drive unmounted"

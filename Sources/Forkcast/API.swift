@@ -172,7 +172,7 @@ final class APIServer {
                 "GET /status", "GET /processes?group_by=job|app|tree&limit=N", "GET /headroom[?group=g]",
                 "GET /jobs[?group=g]", "GET /jobs/<name>", "GET /groups", "GET /groups/<g>/eta",
                 "POST /jobs/register", "POST /jobs/<name>/progress", "POST /jobs/<name>/beat", "POST /jobs/<name>/exit",
-                "POST /jobs/<name>/start", "DELETE /jobs/<name>", "POST /groups/<g>/pause", "POST /groups/<g>/resume",
+                "POST /jobs/<name>/start", "POST /jobs/<name>/state", "DELETE /jobs/<name>", "POST /groups/<g>/pause", "POST /groups/<g>/resume",
                 "GET /events?since=<ts|1h>&types=a,b", "GET /changes?since=<ts|1h>", "GET /wait?until=<expr>&timeout=<s|3h>",
                 "GET /guards", "POST /guards", "DELETE /guards/<name>", "GET /history?metric=<m>&range=24h&step=60s",
                 "GET /metrics",
@@ -205,6 +205,7 @@ final class APIServer {
             case "progress": ok(try engine.progress(name, decode(ProgressRequest.self, r.body)), reply)
             case "beat": ok(try engine.beat(name), reply)
             case "exit": ok(try engine.exitJob(name, decode(ExitRequest.self, r.body)), reply)
+            case "state": ok(try engine.setJobState(name, decode(StateRequest.self, r.body)), reply)
             case "start":
                 struct S: Codable { var pid: Int32 }
                 ok(try engine.startQueued(name, pid: decode(S.self, r.body).pid), reply)
@@ -233,12 +234,22 @@ final class APIServer {
             let evs = engine.events(since: from, types: ["job", "crash", "alert", "guard", "group", "headroom"], limit: 1000)
             struct Changes: Codable {
                 var since: Date; var started: [String]; var finished: [String]; var failed: [String]; var stale: [String]
-                var crashed: [String]; var alerts: [String]; var events: [EventInfo]
+                var crashed: [String]; var earlierRuns: [String]; var alerts: [String]; var events: [EventInfo]
             }
-            func subj(_ t: [String]) -> [String] { Array(Set(evs.filter { t.contains($0.type) }.compactMap(\.subject))).sorted() }
+            // Outcomes belong to a run: a finish/failure/stale that happened before the name was registered
+            // again describes an earlier run, so it is listed under earlierRuns, not as the job's state.
+            var lastRegistered: [String: Date] = [:]
+            for e in evs where e.type == "job.registered" { if let s = e.subject { lastRegistered[s] = max(lastRegistered[s] ?? .distantPast, e.time) } }
+            func current(_ e: EventInfo) -> Bool { e.subject.map { e.time >= (lastRegistered[$0] ?? .distantPast) } ?? true }
+            func subj(_ t: [String]) -> [String] {
+                Array(Set(evs.filter { t.contains($0.type) && current($0) }.compactMap(\.subject))).sorted()
+            }
+            let outcomes = ["job.finished", "job.exited", "job.failed", "job.crashed", "job.stale"]
+            let earlier = evs.filter { (outcomes.contains($0.type) && !current($0)) || $0.type == "job.run_ended" }
+                .sorted { $0.time < $1.time }.map(\.message)
             ok(Changes(since: from, started: subj(["job.registered", "job.started"]), finished: subj(["job.finished", "job.exited"]),
                        failed: subj(["job.failed", "job.crashed"]), stale: subj(["job.stale"]), crashed: subj(["crash"]),
-                       alerts: evs.filter { $0.type == "alert.fired" }.map(\.message), events: evs), reply)
+                       earlierRuns: earlier, alerts: evs.filter { $0.type == "alert.fired" }.map(\.message), events: evs), reply)
 
         case ("GET", "wait"):
             guard let expr = r.query["until"], !expr.isEmpty else { throw ExprError(message: "missing ?until=<expression>") }

@@ -189,10 +189,11 @@ func printStatus(_ s: Status) {
     let m = s.memory
     print("Memory   pressure \(m.pressure) · \(f1(m.usedGB))/\(f0(m.totalGB)) GB used · compressed \(f1(m.compressedGB)) GB · swap \(f1(m.swapUsedGB)) GB\(m.swapGrowthGBPerHour.map { " (\($0 >= 0 ? "+" : "")\(f1($0)) GB/h)" } ?? "") · headroom ~\(f1(m.headroomGB)) GB")
     let d = s.disk
-    var dl = "Disk     \(f0(d.freeInclPurgeableGB)) GB free (\(f0(d.purgeableGB)) GB purgeable"
-    if let n = d.tmLocalSnapshots { dl += ", \(n) TM local snapshots" }
+    var dl = "Disk     \(f0(d.freeGB)) GB free now, \(f0(d.freeInclPurgeableGB)) GB incl. purgeable (macOS estimate"
+    if let n = d.tmLocalSnapshots { dl += "; \(n) TM local snapshot\(n == 1 ? "" : "s")" }
     dl += ")"
     if let t = d.trendGBPerHour { dl += " · \(t >= 0 ? "+" : "")\(f1(t)) GB/h" }
+    if let st = d.lastStep { dl += " (excl. a one-off \(st.deltaGB >= 0 ? "+" : "")\(f1(st.deltaGB)) GB step at \(shortTime.string(from: st.at)))" }
     if let h = d.hoursToFloor { dl += " · hits \(f0(d.floorGB)) GB in ~\(dur(h * 3600))" }
     dl += " · I/O r \(f1(d.readMBs)) w \(f1(d.writeMBs)) MB/s"
     if let t = d.topIOProcess { dl += " (top: \(t))" }
@@ -202,29 +203,68 @@ func printStatus(_ s: Status) {
     print("Network  ↓\(f1(n.downMBs)) ↑\(f1(n.upMBs)) MB/s · today ↓\(f1(n.todayDownGB)) ↑\(f1(n.todayUpGB)) GB\(n.topProcess.map { " · top: \($0)" } ?? "")")
     for f in s.folders { print("Folder   \(f.path): \(f1(f.sizeGB)) GB\(f.growthGBPerHour.map { " (\($0 >= 0 ? "+" : "")\(f1($0)) GB/h)" } ?? "")") }
     print("Headroom \(s.headroom.verdict)")
-    for a in s.alerts { print("ALERT    [\(a.severity)] \(a.message)") }
+    for a in s.alerts { print("\(a.severity == "info" ? "NOTE " : "ALERT")    [\(a.severity)] \(a.message)") }
     print("\nTop groups:")
     for g in s.topGroups.prefix(8) {
         print("  \(pad(g.label, 44)) \(pad(f1(g.watts) + " W", 8)) \(pad(f0(g.cpuPct) + "%", 6)) \(pad(f0(g.memMB) + " MB", 9)) \(g.procCount) proc\(g.paused ? " · PAUSED" : "")")
     }
     if !s.jobs.isEmpty { print("\nJobs:"); printJobs(s.jobs) }
     for e in s.jobGroups where e.running + e.queued > 0 {
-        print("  ETA \(e.group): \(dur(e.etaSeconds))\(e.etaDate.map { " (\(timeFmt.string(from: $0)))" } ?? "")")
+        print("  ETA \(e.group): \(etaText(e))\(e.etaDate.map { " (\(e.etaIsLowerBound ? "not before " : "")\(timeFmt.string(from: $0)))" } ?? "")")
     }
 }
 
+let shortTime: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
+
+/// "7h20m", "≥ 7h20m, 3 jobs without ETA", or "– (3 jobs without ETA)".
+func etaText(_ e: GroupETA) -> String {
+    let n = e.jobsWithoutETA.count
+    let jobsTxt = "\(n) job\(n == 1 ? "" : "s") without ETA"
+    guard let s = e.etaSeconds else { return n == 0 ? "–" : "– (\(jobsTxt))" }
+    return e.etaIsLowerBound ? "≥ \(dur(s)), \(jobsTxt)" : dur(s)
+}
+
+/// Full names, never truncated: columns are as wide as the longest value.
+func jobLabel(_ j: JobInfo) -> String {
+    let run: String = (j.run ?? 1) > 1 ? " #\(j.run ?? 1)" : ""
+    return j.group + "/" + j.name + run
+}
+
 func printJobs(_ js: [JobInfo]) {
-    for j in js {
-        var l = "  \(pad(j.group + "/" + j.name, 30)) \(pad(j.state, 10))"
+    let labels: [String] = js.map(jobLabel)
+    let nameW: Int = max(10, labels.map(\.count).max() ?? 0)
+    let stateW: Int = max(7, js.map(\.displayState.count).max() ?? 0)
+    for (i, j) in js.enumerated() {
+        var l = "  \(pad(labels[i], nameW)) \(pad(j.displayState, stateW))"
         if let d = j.done { l += " \(pad(f0(d) + (j.total.map { "/" + f0($0) } ?? ""), 12))" }
-        if let r = j.ratePerHour { l += " \(f0(r))/h" }
-        if let e = j.etaSeconds { l += " · ETA \(dur(e))" }
+        if let r = j.ratePerHour, !j.isFinished {
+            l += " \(f0(r))/h"
+            if let e = j.etaSeconds { l += " → ETA \(dur(e))" }
+            else if j.total != nil && r <= 0 { l += " (no ETA while stalled)" }
+        } else if !j.isFinished, j.total == nil, j.state != "queued" {
+            l += " (no total: no ETA)"
+        }
+        if let w = j.waitingOn { l += " · waiting for \(w)" }
         if let a = j.secondsSinceActivity { l += " · last activity \(dur(a)) ago" }
         if !j.isFinished && j.state != "queued" { l += " · \(f0(j.cost.cpuPct))% CPU \(f0(j.cost.memMB)) MB \(f1(j.cost.watts)) W" }
         if let c = j.exitCode { l += " · exit \(c)" }
+        if j.logMissing == true { l += " · LOG NOT FOUND" }
         print(l)
     }
 }
+
+/// Resolves a --log path the way the app will (relative to this shell's cwd) and warns if it doesn't exist.
+func clientLogPath(_ v: String?) -> String? {
+    guard let v else { return nil }
+    let t = (v as NSString).expandingTildeInPath
+    let abs = t.hasPrefix("/") ? t : (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent(t)
+    let p = (abs as NSString).standardizingPath
+    if !FileManager.default.fileExists(atPath: p) {
+        fputs("forkcast: note: log \(p) doesn't exist yet — it won't count as activity until it does\n", stderr)
+    }
+    return p
+}
+let clientCwd = FileManager.default.currentDirectoryPath
 
 func printTree(_ gs: [GroupInfo], depth: Int = 0) {
     for g in gs where g.watts > 0.001 || g.cpuPct > 0.1 || depth == 0 {
@@ -234,7 +274,7 @@ func printTree(_ gs: [GroupInfo], depth: Int = 0) {
 }
 
 func printETA(_ e: GroupETA) {
-    print("\(pad(e.group, 20)) ETA \(dur(e.etaSeconds))\(e.etaDate.map { " (\(timeFmt.string(from: $0)))" } ?? "") · \(e.running) running, \(e.queued) queued, \(e.finished) done · \(f0(e.throughputPerHour))/h")
+    print("\(pad(e.group, 20)) ETA \(etaText(e))\(e.etaDate.map { " (\(e.etaIsLowerBound ? "not before " : "")\(timeFmt.string(from: $0)))" } ?? "") · \(e.running) running, \(e.queued) queued, \(e.finished) done · \(f0(e.throughputPerHour))/h")
     print("    basis: \(e.basis)")
 }
 
@@ -354,6 +394,7 @@ case "changes":
             let v = (o[k] as? [String]) ?? []
             print("\(pad(k, 9)) \(v.isEmpty ? "—" : v.joined(separator: ", "))")
         }
+        for r in (o["earlierRuns"] as? [String]) ?? [] { print("earlier   \(r)") }
         for al in (o["alerts"] as? [String]) ?? [] { print("alert     \(al)") }
     }
 
@@ -378,8 +419,11 @@ case "job":
         printJobs([j])
         if let b = j.etaBasis { print("  ETA basis: \(b)") }
         if let c = j.command { print("  $ \(c)") }
-        if let l = j.log { print("  log: \(l)") }
+        if let l = j.log { print("  log: \(l)\(j.logMissing == true ? "  (NOT FOUND — doesn't count as activity)" : "")") }
         if let n = j.note { print("  note: \(n)") }
+        for r in j.previousRuns ?? [] {
+            print("  run #\(r.run): \(r.state == "exited" ? "ended" : r.state)\(r.exitCode.map { " (exit \($0))" } ?? "")\(r.done.map { " · \(f0($0))\(r.total.map { "/" + f0($0) } ?? "")" } ?? "")\(r.endedAt.map { " · ended \(timeFmt.string(from: $0))" } ?? "")")
+        }
     }
 
 case "eta":
@@ -404,20 +448,38 @@ case "register":
     if let s = a.value("--pid") { guard let v = Int32(s) else { die("--pid must be a number", 2) }; pid = v }
     let req: [String: AnyEncodable] = [
         "name": AnyEncodable(name), "group": AnyEncodable(a.value("--group") ?? "default"), "pid": AnyEncodable(pid),
-        "log": AnyEncodable(a.value("--log").map { ($0 as NSString).expandingTildeInPath }), "logRegex": AnyEncodable(a.value("--regex")),
+        "log": AnyEncodable(clientLogPath(a.value("--log"))), "logRegex": AnyEncodable(a.value("--regex")),
         "total": AnyEncodable(a.value("--total").flatMap(Double.init)), "after": AnyEncodable(a.value("--after")),
-        "staleAfter": AnyEncodable(staleOption(a)),
+        "staleAfter": AnyEncodable(staleOption(a)), "cwd": AnyEncodable(clientCwd),
     ]
     let (j, data) = Client.load().send("POST", "/jobs/register", req, JobInfo.self)
-    json ? printJSON(data) : print("registered \(j.group)/\(j.name) (\(j.state))")
+    json ? printJSON(data) : print("registered \(j.group)/\(j.name)\((j.run ?? 1) > 1 ? " run #\(j.run!)" : "") (\(j.state))\(j.log.map { " · log \($0)" } ?? "")")
 
 case "progress":
     let name = need(a, 0, "job NAME", cmd)
-    let prog = need(a, 1, "progress DONE[/TOTAL]", cmd)
+    let prog = a.positional.count > 1 ? a.positional[1] : nil
+    var total: Double?
+    if let t = a.value("--total") { guard let v = Double(t) else { die("--total must be a number", 2) }; total = v }
+    guard prog != nil || total != nil || a.value("--log") != nil || a.value("--regex") != nil || a.value("--note") != nil || a.value("--stale") != nil else {
+        die("give DONE[/TOTAL], or at least one of --total, --log, --regex, --stale, --note\nusage: \(cmd.synopsis)", 2)
+    }
     let req: [String: AnyEncodable] = ["progress": AnyEncodable(prog), "note": AnyEncodable(a.value("--note")),
-                                       "total": AnyEncodable(a.value("--total").flatMap(Double.init))]
-    let (j, _) = Client.load().send("POST", "/jobs/\(path(name))/progress", req, JobInfo.self)
-    print("\(j.name): \(f0(j.done))\(j.total.map { "/" + f0($0) } ?? "")\(j.etaSeconds.map { " · ETA \(dur($0))" } ?? "")")
+                                       "total": AnyEncodable(total), "log": AnyEncodable(clientLogPath(a.value("--log"))),
+                                       "logRegex": AnyEncodable(a.value("--regex")), "cwd": AnyEncodable(clientCwd),
+                                       "staleAfter": AnyEncodable(staleOption(a))]
+    let (j, data) = Client.load().send("POST", "/jobs/\(path(name))/progress", req, JobInfo.self)
+    if json { printJSON(data) } else {
+        print("\(j.name): \(f0(j.done))\(j.total.map { "/" + f0($0) } ?? "")\(j.etaSeconds.map { " · ETA \(dur($0))" } ?? "")\(j.log.map { " · log \($0)" } ?? "")")
+    }
+
+case "state":
+    let name = need(a, 0, "job NAME", cmd)
+    let st = need(a, 1, "STATE (waiting or running)", cmd).lowercased()
+    guard st == "waiting" || st == "running" else { die("STATE must be waiting or running", 2) }
+    var on = a.value("--on")
+    if st == "waiting", on == nil, a.positional.count > 2 { on = a.positional[2...].joined(separator: " ") }
+    let (j, data) = Client.load().send("POST", "/jobs/\(path(name))/state", ["state": st, "on": on], JobInfo.self)
+    json ? printJSON(data) : print("\(j.name): \(j.displayState)\(j.waitingOn.map { " (waiting for \($0))" } ?? "")")
 
 case "beat":
     let name = need(a, 0, "job NAME", cmd)
@@ -483,7 +545,7 @@ case "run":
     let name = a.value("--name") ?? (command[0] as NSString).lastPathComponent
     let group = a.value("--group") ?? "default"
     let after = a.value("--after")
-    let log = a.value("--log").map { ($0 as NSString).expandingTildeInPath }
+    let log = clientLogPath(a.value("--log"))
     let cmdline = command.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " ")
     let stale = staleOption(a)
     let client = Client.connect()
@@ -491,14 +553,25 @@ case "run":
     func reg(pid: Int32?) -> [String: AnyEncodable] {
         ["name": AnyEncodable(name), "group": AnyEncodable(group), "pid": AnyEncodable(pid), "after": AnyEncodable(after),
          "log": AnyEncodable(log), "logRegex": AnyEncodable(a.value("--regex")), "total": AnyEncodable(a.value("--total").flatMap(Double.init)),
-         "command": AnyEncodable(cmdline), "managed": AnyEncodable(true), "staleAfter": AnyEncodable(stale)]
+         "command": AnyEncodable(cmdline), "managed": AnyEncodable(true), "staleAfter": AnyEncodable(stale),
+         "cwd": AnyEncodable(clientCwd)]
     }
-    if let after, let c = client {
-        _ = c.send("POST", "/jobs/register", reg(pid: nil), JobInfo.self)
-        fputs("forkcast: \(name) queued — waiting for \(after) to finish…\n", stderr)
-        while true {
-            let (w, _) = c.get("/wait", WaitResult.self, query: ["until": "job \(after) done", "timeout": "3600"], timeout: 3700)
-            if w.met { break }
+    var runId: Int?
+    if let after {
+        // --after takes a job name, or a pid ("1234" when no job has that name, or "pid 1234").
+        var cond = "job \(after) done"
+        let lower = after.lowercased()
+        if lower.hasPrefix("pid ") || lower.hasPrefix("pid:") { cond = "pid \(after.dropFirst(4).trimmingCharacters(in: .whitespaces)) exits" }
+        else if Int32(after) != nil, client.map({ $0.call("GET", "/jobs/" + path(after)).0 == 404 }) ?? true { cond = "pid \(after) exits" }
+        if let c = client {
+            runId = c.send("POST", "/jobs/register", reg(pid: nil), JobInfo.self).0.run
+            fputs("forkcast: \(name) queued — waiting until \(cond)…\n", stderr)
+            while true {
+                let (w, _) = c.get("/wait", WaitResult.self, query: ["until": cond, "timeout": "3600"], timeout: 3700)
+                if w.met { break }
+            }
+        } else if cond.hasPrefix("pid "), let p = Int32(cond.split(separator: " ")[1]) {
+            while kill(p, 0) == 0 || errno == EPERM { sleep(2) }
         }
     }
     var pid: pid_t = 0
@@ -508,8 +581,8 @@ case "run":
     command.removeAll()
     guard rc == 0 else { die("can't start \(a.passthrough[0]): \(String(cString: strerror(rc)))", 127) }
     if let c = client {
-        if after != nil { _ = c.send("POST", "/jobs/\(path(name))/start", ["pid": pid], JobInfo.self) }
-        else { _ = c.send("POST", "/jobs/register", reg(pid: pid), JobInfo.self) }
+        if after != nil { runId = c.send("POST", "/jobs/\(path(name))/start", ["pid": pid], JobInfo.self).0.run ?? runId }
+        else { runId = c.send("POST", "/jobs/register", reg(pid: pid), JobInfo.self).0.run }
     }
     var sources: [DispatchSourceSignal] = []
     for sig in [SIGINT, SIGTERM, SIGHUP] {
@@ -525,7 +598,8 @@ case "run":
         let exited = (status & 0x7f) == 0
         let code: Int32? = exited ? (status >> 8) & 0xff : nil
         let sig: Int32? = exited ? nil : status & 0x7f
-        if let c = client { _ = c.raw("POST", "/jobs/\(path(name))/exit", body: try? JSON.encoder.encode(["code": code, "signal": sig])) }
+        struct Exit: Encodable { var code: Int32?; var signal: Int32?; var run: Int? }
+        if let c = client { _ = c.raw("POST", "/jobs/\(path(name))/exit", body: try? JSON.encoder.encode(Exit(code: code, signal: sig, run: runId))) }
         exit(code ?? (128 + (sig ?? 0)))
     }
     withExtendedLifetime(sources) { dispatchMain() }

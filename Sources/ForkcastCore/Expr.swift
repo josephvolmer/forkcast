@@ -5,7 +5,8 @@ import Foundation
 ///   battery > 25
 ///   on_ac and net_battery_w > 0
 ///   disk_free_gb < 50 or mem_pressure == red
-///   job batch7 done            (done | ok | failed | running | stale | paused | exists | started)
+///   job batch7 done            (done | ok | failed | running | waiting | stale | paused | exists | started)
+///                              always the latest run of that name
 ///   pid 12345 exits          (exits | running)
 ///   group renders idle      (idle | busy | paused | running | done | exists)
 ///   file /path/done.flag exists      (exists | missing)
@@ -38,7 +39,7 @@ public indirect enum Expr: CustomStringConvertible, Sendable {
         }
     }
 
-    static func fmt(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
+    public static func fmt(_ v: Double) -> String { v == v.rounded() ? String(Int(v)) : String(v) }
 
     public static let metrics: [String: String] = [
         "battery": "battery percent", "on_ac": "1 when on the charger", "charging": "1 when charging",
@@ -48,7 +49,9 @@ public indirect enum Expr: CustomStringConvertible, Sendable {
         "cpu_busy_cores": "busy core-equivalents", "cpu_free_cores": "free cores (p90, 30 min)",
         "cpu_pct": "busy % of all cores", "thermal": "0 nominal … 3 critical", "throttling": "1 when throttling",
         "mem_pressure": "0 green, 1 yellow, 2 red", "mem_headroom_gb": "memory left before yellow",
-        "swap_gb": "swap used", "swap_growth_gb_h": "swap growth per hour", "disk_free_gb": "free on /",
+        "swap_gb": "swap used", "swap_growth_gb_h": "swap growth per hour",
+        "disk_free_gb": "free on / right now (statvfs, same as df)",
+        "disk_free_purgeable_gb": "free on / incl. what macOS says it can purge (caches, TM snapshots)",
         "disk_hours_to_floor": "hours until disk hits the floor", "disk_read_mbs": "MB/s",
         "disk_write_mbs": "MB/s", "net_down_mbs": "MB/s", "net_up_mbs": "MB/s",
         "net_today_up_gb": "uploaded today", "net_today_down_gb": "downloaded today", "alerts": "active alert count",
@@ -60,7 +63,7 @@ public indirect enum Expr: CustomStringConvertible, Sendable {
         "true": 1, "false": 0, "yes": 1, "no": 0,
     ]
 
-    static let jobStates: Set<String> = ["done", "finished", "ok", "failed", "running", "stale", "paused", "exists", "started"]
+    static let jobStates: Set<String> = ["done", "finished", "ok", "failed", "running", "waiting", "stale", "paused", "exists", "started"]
     static let pidStates: Set<String> = ["exits", "exited", "dead", "running", "alive"]
     static let groupStates: Set<String> = ["idle", "busy", "paused", "running", "done", "exists"]
 }
@@ -288,7 +291,7 @@ public extension Expr {
             case "done", "finished": ok = finished
             case "ok": ok = s == "done-ok"
             case "failed": ok = s == "done-error" || s == "killed"
-            case "running": ok = s == "running" || s == "stale"
+            case "running": ok = s == "running" || s == "stale" || s == "waiting"
             case "started": ok = s != "queued"
             case "exists": ok = true
             default: ok = s == st
@@ -317,6 +320,16 @@ public extension Expr {
             return ok ? (true, description) : (false, nil)
         case let .process(name):
             return ctx.processRunning(name) ? (true, description) : (false, nil)
+        }
+    }
+
+    /// True if the expression asks about a registered job (its record may be replaced by a new run).
+    var mentionsJob: Bool {
+        switch self {
+        case let .and(a, b), let .or(a, b): return a.mentionsJob || b.mentionsJob
+        case let .not(a): return a.mentionsJob
+        case .job: return true
+        default: return false
         }
     }
 

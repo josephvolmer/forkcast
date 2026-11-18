@@ -61,11 +61,12 @@ public struct MemoryInfo: Codable, Sendable {
 public struct DiskInfo: Codable, Sendable {
     public var path = "/"
     public var totalGB = 0.0
-    public var freeGB = 0.0                 // immediately free
-    public var freeInclPurgeableGB = 0.0    // what macOS can make free (incl. caches, TM local snapshots)
-    public var purgeableGB = 0.0
+    public var freeGB = 0.0                 // free right now (statvfs f_bavail, same as `df`); used by alerts and disk_free_gb
+    public var freeInclPurgeableGB = 0.0    // macOS' estimate of what it could make free (caches, TM local snapshots)
+    public var purgeableGB = 0.0            // freeInclPurgeableGB − freeGB (macOS' estimate, refreshed every 60 s)
     public var tmLocalSnapshots: Int?
-    public var trendGBPerHour: Double?      // negative = filling up
+    public var trendGBPerHour: Double?      // negative = filling up; one-off steps (cleanups, big copies) are left out
+    public var lastStep: DiskStep?          // most recent one-off jump in free space (excluded from the trend)
     public var floorGB = 40.0
     public var hoursToFloor: Double?
     public var readMBs = 0.0
@@ -74,6 +75,12 @@ public struct DiskInfo: Codable, Sendable {
     public var topIOMBs: Double?
     public var ioPeakMBs: Double?           // highest read+write seen (for headroom)
     public init() {}
+}
+
+public struct DiskStep: Codable, Sendable {
+    public var at: Date
+    public var deltaGB: Double              // + = space freed, − = space used, within one 5-minute bucket
+    public init(at: Date, deltaGB: Double) { self.at = at; self.deltaGB = deltaGB }
 }
 
 public struct VolumeInfo: Codable, Sendable, Identifiable {
@@ -164,20 +171,41 @@ public struct JobCost: Codable, Sendable {
     public init() {}
 }
 
+/// An earlier run of a job name that was registered again (kept for history).
+public struct JobRunSummary: Codable, Sendable {
+    public var run: Int
+    public var state: String
+    public var pid: Int32?
+    public var registeredAt: Date
+    public var startedAt: Date?
+    public var endedAt: Date?
+    public var exitCode: Int32?
+    public var done: Double?
+    public var total: Double?
+    public init(_ j: JobInfo) {
+        run = j.run ?? 1; state = j.state; pid = j.pid; registeredAt = j.registeredAt; startedAt = j.startedAt
+        endedAt = j.endedAt; exitCode = j.exitCode; done = j.done; total = j.total
+    }
+}
+
 public struct JobInfo: Codable, Sendable, Identifiable {
     public var id: String { name }
     public var name: String
     public var group: String
+    public var run: Int?                    // 1, 2, … — registering the same name again starts a new run
     public var pid: Int32?
     public var command: String?
-    public var log: String?
+    public var cwd: String?                 // working directory of the registering client
+    public var log: String?                 // absolute path (relative --log is resolved against cwd)
+    public var logMissing: Bool?            // true while the log file doesn't exist
     public var logRegex: String?
     public var staleAfterSeconds: Double?   // per-job stale timeout; 0 = never stale; nil = global default
     public var total: Double?
     public var done: Double?
     public var note: String?
     public var after: String?
-    public var state: String = "running"    // queued | running | paused | stale | done-ok | done-error | killed | exited
+    public var state: String = "running"    // queued | running | waiting | paused | stale | done-ok | done-error | killed | exited
+    public var waitingOn: String?           // set by `forkcast state NAME waiting --on X` (job name or "pid N")
     public var ratePerHour: Double?
     public var etaSeconds: Double?
     public var etaBasis: String?
@@ -191,7 +219,11 @@ public struct JobInfo: Codable, Sendable, Identifiable {
     public var secondsSinceActivity: Double?
     public var cost = JobCost()
     public var pausedNote: String?
+    public var previousRuns: [JobRunSummary]? // earlier runs under this name, newest first
     public init(name: String, group: String) { self.name = name; self.group = group }
+
+    /// "exited" means the process ended but its exit code can't be known (registered by pid).
+    public var displayState: String { state == "exited" ? "ended" : state }
 
     public var isFinished: Bool { ["done-ok", "done-error", "killed", "exited"].contains(state) }
     public var fraction: Double? {
@@ -209,6 +241,8 @@ public struct GroupETA: Codable, Sendable {
     public var throughputPerHour: Double?
     public var etaSeconds: Double?
     public var etaDate: Date?
+    public var etaIsLowerBound = false      // some unfinished jobs have no ETA: the group takes at least etaSeconds
+    public var jobsWithoutETA: [String] = []
     public var basis: String
     public init(group: String, jobs: [String], running: Int, finished: Int, queued: Int, basis: String) {
         self.group = group; self.jobs = jobs; self.running = running; self.finished = finished
@@ -221,7 +255,7 @@ public struct AlertInfo: Codable, Sendable, Identifiable {
     public var type: String
     public var subject: String?
     public var message: String
-    public var severity: String             // warning | critical
+    public var severity: String             // info | warning | critical
     public var since: Date
     public init(type: String, subject: String?, message: String, severity: String, since: Date) {
         self.id = type + "|" + (subject ?? ""); self.type = type; self.subject = subject

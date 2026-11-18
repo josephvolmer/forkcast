@@ -20,7 +20,7 @@ final class HeadroomTracker {
         ioPeakMBs = Double(store.get("ioPeakMBs") ?? "") ?? 0
     }
 
-    func record(busyCores: Double, groups: [GroupInfo], diskMBs: Double, now: Date) {
+    func record(busyCores: Double, groups: [GroupInfo], diskMBs: Double, waiting: Set<String> = [], now: Date) {
         busy.append((now, busyCores))
         busy.removeAll { now.timeIntervalSince($0.0) > 1800 }
         if diskMBs > ioPeakMBs * 1.05 {
@@ -30,6 +30,7 @@ final class HeadroomTracker {
         var alive = Set<String>()
         for g in groups where g.kind == "job" || g.kind == "registered" {
             alive.insert(g.id)
+            if let j = g.jobName, waiting.contains(j) { continue }   // declared waiting: not a cost sample
             // Idle instances (e.g. a lane waiting for an earlier lane) must not dilute the per-instance cost.
             guard g.cpuPct >= 3 || g.diskReadMBs + g.diskWriteMBs >= 0.2 else { continue }
             lastActive[g.id] = now
@@ -56,7 +57,8 @@ final class HeadroomTracker {
         return max(0, Double(total) - Self.p90(busy.map(\.1)))
     }
 
-    func compute(cpu: CPUInfo, mem: MemoryInfo, power: PowerInfo, disk: DiskInfo, groups: [GroupInfo], now: Date) -> Headroom {
+    func compute(cpu: CPUInfo, mem: MemoryInfo, power: PowerInfo, disk: DiskInfo, groups: [GroupInfo],
+                 waiting: Set<String> = [], now: Date) -> Headroom {
         var h = Headroom()
         h.freeCoresP90 = freeCoresP90(total: cpu.totalCores) ?? max(0, Double(cpu.totalCores) - cpu.busyCores)
         h.memHeadroomGB = mem.headroomGB
@@ -66,7 +68,8 @@ final class HeadroomTracker {
 
         var live: [String: Int] = [:], idle: [String: Int] = [:]
         for g in groups where g.kind == "job" || g.kind == "registered" {
-            if let t = lastActive[g.id], now.timeIntervalSince(t) <= Self.activeWindow { live[g.kindKey, default: 0] += 1 }
+            if let j = g.jobName, waiting.contains(j) { idle[g.kindKey, default: 0] += 1 }
+            else if let t = lastActive[g.id], now.timeIntervalSince(t) <= Self.activeWindow { live[g.kindKey, default: 0] += 1 }
             else { idle[g.kindKey, default: 0] += 1 }
         }
 

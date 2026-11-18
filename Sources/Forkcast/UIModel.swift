@@ -238,4 +238,4 @@ func marginColor(_ p: PowerInfo) -> Color {
     guard p.onAC, let m = p.marginW else { return .primary }
     return m > 5 ? Palette.teal : m >= 0 ? Palette.amber : Palette.red
 }
-func severityColor(_ s: String) -> Color { s == "critical" ? Palette.red : Palette.amber }
+func severityColor(_ s: String) -> Color { s == "critical" ? Palette.red : s == "info" ? .secondary : Palette.amber }

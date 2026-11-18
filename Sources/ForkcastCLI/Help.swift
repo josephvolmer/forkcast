@@ -97,29 +97,33 @@ let commands: [Command] = [
 
     // MARK: Jobs
     Command(name: "run", category: "Jobs",
-            synopsis: "forkcast run --name N [--group G] [--log FILE] [--regex R] [--total T] [--after JOB] -- COMMAND [ARGS…]",
+            synopsis: "forkcast run --name N [--group G] [--log FILE] [--regex R] [--total T] [--after JOB|PID] -- COMMAND [ARGS…]",
             summary: "Start a command and track it as a job: its whole process tree, progress, ETA and exit code.",
             details: """
             The command inherits your terminal (stdin/stdout/stderr). Ctrl-C, SIGTERM and SIGHUP are forwarded to it, and \
             forkcast exits with the command's exit code (128+signal if it was killed). With --after, the job is registered \
-            as queued and starts when JOB finishes. With --log, progress is read from the last "done/total" match in the \
-            file (or --regex with two capture groups). If Forkcast isn't running the command still runs, untracked.
+            as queued and starts when JOB finishes (or, given a pid, when that process exits). With --log, progress is read \
+            from the last "done/total" match in the file (or --regex with two capture groups); a relative path is resolved \
+            against the current directory and stored as an absolute path. Re-using a name starts a new run (#2, #3…): the \
+            previous run moves to the job's history, and `job NAME …` conditions always mean the latest run. If Forkcast \
+            isn't running the command still runs, untracked.
             """,
-            options: [Option(flag: "--name N", help: "Job name (default: the command's file name). Re-using a name replaces the old job."),
+            options: [Option(flag: "--name N", help: "Job name (default: the command's file name). Re-using a name starts a new run; the old one is kept in history."),
                       Option(flag: "--group G", help: "Job group for ETAs, pause/resume and guards (default: default)."),
                       Option(flag: "--log FILE", help: "Log file to read progress and activity from."),
                       Option(flag: "--regex R", help: "Progress regex; group 1 = done, group 2 = total. Default (\\d+)\\s*/\\s*(\\d+)."),
                       Option(flag: "--total T", help: "Total items, for progress % and ETA."),
-                      Option(flag: "--after JOB", help: "Queue: wait for JOB to finish before starting."),
+                      Option(flag: "--after JOB", help: "Queue: wait for JOB to finish (or a pid, e.g. 4242 or 'pid 4242', to exit) before starting."),
                       Option(flag: "--stale DUR", help: "Stale after this long without progress, heartbeat or log output (e.g. 3h), or 'never'. Default 15m (config: alerts.jobStaleMinutes).")],
             examples: ["forkcast run --name batch7 --group renders --log render.log --total 1721 -- ./render.sh batch7",
+                       "forkcast run --name lane2 --group captures --after 4242 -- ./lane.sh 2   # starts when pid 4242 exits",
                        "forkcast run --name queue --group renders --log queue.log --stale 3h -- ./queue.sh   # logs only START/END",
                        "forkcast run --name batch7-2 --group renders --after batch7 -- ./render.sh batch7-2"],
             exitCodes: "the command's own exit code · 127 command not found · 2 usage error"),
     Command(name: "register", category: "Jobs",
             synopsis: "forkcast register --name N --pid PID [--group G] [--log FILE] [--regex R] [--total T] [--after JOB] [--json]",
             summary: "Track an already-running process (and every child it spawns) as a job.",
-            details: "Without --pid the job is registered as queued. The exit code of a registered (not `run`) process can't be known; it ends as done-ok if progress reached the total, otherwise exited.",
+            details: "Without --pid the job is registered as queued. The exit code of a registered (not `run`) process can't be known; it ends as done-ok if progress reached the total, otherwise as ended (state \"exited\", shown neutrally, not as an alert). A relative --log is resolved against the current directory.",
             options: [Option(flag: "--name N", help: "Job name (required)."), Option(flag: "--pid PID", help: "Root process of the job."),
                       Option(flag: "--group G", help: "Job group (default: default)."), Option(flag: "--log FILE", help: "Log to read progress from."),
                       Option(flag: "--regex R", help: "Progress regex (see `forkcast run --help`)."), Option(flag: "--total T", help: "Total items."),
@@ -127,10 +131,22 @@ let commands: [Command] = [
                       Option(flag: "--stale DUR", help: "Stale after this long without progress, heartbeat or log output (e.g. 3h), or 'never'. Default 15m (config: alerts.jobStaleMinutes)."), jsonOpt],
             examples: ["forkcast register --name ghidra --group analysis --pid 4242", "./render.sh & forkcast register --name r1 --group renders --pid $! --log render.log"]),
     Command(name: "progress", category: "Jobs",
-            synopsis: "forkcast progress NAME DONE[/TOTAL] [--total T] [--note TEXT]",
-            summary: "Report explicit progress for a job (feeds rate and ETA).",
-            options: [Option(flag: "--total T", help: "Set or change the total."), Option(flag: "--note TEXT", help: "Short status note shown with the job.")],
-            examples: ["forkcast progress batch7 412/1721", "forkcast progress batch7 413 --note 'bank B'"]),
+            synopsis: "forkcast progress NAME [DONE[/TOTAL]] [--total T] [--log FILE] [--regex R] [--stale DUR] [--note TEXT] [--json]",
+            summary: "Report progress for a job, or change how its progress is measured, without restarting it.",
+            details: "DONE is optional: `--total` alone sets or changes the total of a running job, and `--log`/`--regex` attach a log-based progress rule to it (the log is read on the next sample). Pass an empty --log '' or --regex '' to remove one.",
+            options: [Option(flag: "--total T", help: "Set or change the total."),
+                      Option(flag: "--log FILE", help: "Read progress and activity from this log from now on."),
+                      Option(flag: "--regex R", help: "Progress regex for the log; group 1 = done, group 2 = total."),
+                      Option(flag: "--stale DUR", help: "Change the stale limit (e.g. 3h, or 'never')."),
+                      Option(flag: "--note TEXT", help: "Short status note shown with the job."), jsonOpt],
+            examples: ["forkcast progress batch7 412/1721", "forkcast progress batch7 413 --note 'bank B'",
+                       "forkcast progress arturia-q1 --total 863", "forkcast progress presets2 --log captures/_logs/presets.log --regex 'preset (\\d+) of (\\d+)'"]),
+    Command(name: "state", category: "Jobs",
+            synopsis: "forkcast state NAME waiting [--on JOB|PID] | forkcast state NAME running [--json]",
+            summary: "Mark a job as waiting for another job or process (not stale, not counted in cost cards), or running again.",
+            details: "A waiting job is shown as waiting instead of running with a long \"last activity\" time, never goes stale, and is left out of headroom cost cards. It returns to running by itself when what it waits for ends (a job finishing, or a pid exiting), or when you run `forkcast state NAME running`.",
+            options: [Option(flag: "--on X", help: "What it waits for: a job name, or a pid (4242 or 'pid 4242')."), jsonOpt],
+            examples: ["forkcast state lane2 waiting --on lane1", "forkcast state lane2 waiting --on 'pid 4242'", "forkcast state lane2 running"]),
     Command(name: "beat", category: "Jobs",
             synopsis: "forkcast beat NAME",
             summary: "Heartbeat: the job is alive (no count). Resets its stale timer.",
@@ -138,17 +154,17 @@ let commands: [Command] = [
     Command(name: "jobs", category: "Jobs",
             synopsis: "forkcast jobs [--group G] [--json]",
             summary: "Registered jobs: state, progress, rate, ETA, time since last activity, cost and exit code.",
-            details: "States: queued, running, paused, stale (no progress/log/heartbeat for the job's stale limit — default 15 min, or --stale on run/register), done-ok, done-error, killed, exited.",
+            details: "States: queued, running, waiting (see `forkcast state`), paused, stale (no progress/log/heartbeat for the job's stale limit — default 15 min, or --stale on run/register), done-ok, done-error, killed, ended (JSON state \"exited\": the process ended and its exit code can't be known). Names are never truncated; #N marks a re-run. The ETA is shown only while the job is progressing (rate > 0); a job without a total has no ETA — set one with `forkcast progress NAME --total N`.",
             options: [Option(flag: "--group G", help: "Only this group."), jsonOpt],
             examples: ["forkcast jobs", "forkcast jobs --group renders --json"]),
     Command(name: "job", category: "Jobs",
             synopsis: "forkcast job NAME [--json]",
-            summary: "One job in detail, including its ETA basis and command line.",
+            summary: "One job in detail: ETA basis, command line, log path and earlier runs under the same name.",
             options: [jsonOpt], examples: ["forkcast job batch7"]),
     Command(name: "eta", category: "Jobs",
             synopsis: "forkcast eta [GROUP] [--json]",
             summary: "Combined ETA per job group (when the last job finishes), throughput, and the basis of the estimate.",
-            details: "Queued jobs (--after) are included, assuming the group's average per-job rate.",
+            details: "Queued jobs (--after) are included, assuming the group's average per-job rate. When some unfinished jobs have no ETA (no total), the group ETA is a lower bound, shown as \"≥ 7h20m, 3 jobs without ETA\" (JSON: etaIsLowerBound, jobsWithoutETA).",
             options: [jsonOpt], examples: ["forkcast eta", "forkcast eta renders --json"]),
     Command(name: "forget", category: "Jobs",
             synopsis: "forkcast forget NAME",
@@ -245,7 +261,10 @@ let topics: [String: (title: String, body: String)] = [
     \(Expr.metrics.sorted { $0.key < $1.key }.map { "  " + $0.key.padding(toLength: 22, withPad: " ", startingAt: 0) + $0.value }.joined(separator: "\n"))
 
     pid and file conditions are checked every second; the others update with each sample (every few seconds while \
-    something is waiting).
+    something is waiting). `job NAME …` always refers to the latest run of that name; a wait on a job condition is \
+    first evaluated 3 s after it starts, so a run registered right after (`forkcast run … &`) is the one it sees. \
+    disk_free_gb is free space right now, as df and statvfs report it; disk_free_purgeable_gb adds what macOS says \
+    it could purge.
     """),
     "agents": ("Using forkcast from scripts and AI agents", """
     1. Prefer --json. Field names are stable; units are in the names (W, GB, MBs = MB/s, Pct = 0–100, cores).
@@ -283,9 +302,10 @@ let topics: [String: (title: String, body: String)] = [
     GET  /changes?since=1h
     GET  /wait?until=EXPR&timeout=3h               long-poll; {met, timedOut, fired, waitedSeconds, status}
     GET  /guards                  GET /metrics      GET /history?metric=M&range=24h&step=60s
-    POST /jobs/register           {name, group, pid?, log?, logRegex?, total?, after?, command?}
-    POST /jobs/NAME/progress      {done?, total?, note?}  or  {progress: "412/1721"}
-    POST /jobs/NAME/beat          POST /jobs/NAME/exit {code?, signal?}      POST /jobs/NAME/start {pid}
+    POST /jobs/register           {name, group, pid?, log?, logRegex?, total?, after?, command?, cwd?, staleAfter?}
+    POST /jobs/NAME/progress      {done?, total?, note?, log?, logRegex?, cwd?, staleAfter?}  or  {progress: "412/1721"}
+    POST /jobs/NAME/state         {state: "waiting"|"running", on?}
+    POST /jobs/NAME/beat          POST /jobs/NAME/exit {code?, signal?, run?}      POST /jobs/NAME/start {pid}
     POST /groups/G/pause          POST /groups/G/resume
     POST /guards                  {name, when, forSeconds?, action, group?, resumeWhen?, enabled?}
     DELETE /jobs/NAME             DELETE /guards/NAME

@@ -123,7 +123,12 @@ check: app
 	@mandoc -T lint $(MANPAGE) 2>/dev/null | grep -v STYLE || true
 	@echo "check OK"
 
+# The new app is staged next to the old one first and swapped in right after quitting, so the window in
+# which a script's `forkcast` call could relaunch the old binary is tiny; if that still happens, the
+# final step notices the running process is not the installed binary and restarts it.
 install: app
+	@rm -rf "$(APPS_DIR)/.$(APP_NAME).app.new"
+	ditto $(APP) "$(APPS_DIR)/.$(APP_NAME).app.new"
 	@osascript -e 'quit app "$(APP_NAME)"' 2>/dev/null || true
 	@pkill -x $(APP_NAME) 2>/dev/null || true
 	@pkill -x PowerMonitor 2>/dev/null || true
@@ -131,12 +136,18 @@ install: app
 	@# remove earlier installs in the wrong places
 	@rm -rf "$(HOME)/Applications/$(APP_NAME).app" "$(HOME)/Applications/PowerMonitor.app"
 	@rm -f "$(BIN_DIR)/mon"
-	rm -rf "$(APPS_DIR)/$(APP_NAME).app"
-	ditto $(APP) "$(APPS_DIR)/$(APP_NAME).app"
+	rm -rf "$(APPS_DIR)/$(APP_NAME).app" && mv "$(APPS_DIR)/.$(APP_NAME).app.new" "$(APPS_DIR)/$(APP_NAME).app"
 	@mkdir -p "$(BIN_DIR)" "$(MAN_DIR)"
 	ln -sf "$(APPS_DIR)/$(APP_NAME).app/Contents/Helpers/forkcast" "$(BIN_DIR)/forkcast"
 	ln -sf "$(APPS_DIR)/$(APP_NAME).app/Contents/Resources/forkcast.1" "$(MAN_DIR)/forkcast.1"
 	open "$(APPS_DIR)/$(APP_NAME).app"
+	@sleep 2; exe="$(APPS_DIR)/$(APP_NAME).app/Contents/MacOS/$(APP_NAME)"; want=$$(stat -f %i "$$exe"); \
+	for p in $$(pgrep -x $(APP_NAME)); do \
+		have=$$(lsof -p $$p 2>/dev/null | awk '$$4 == "txt" && $$NF == "'"$$exe"'" {print $$(NF-1); exit}'); \
+		if [ -n "$$have" ] && [ "$$have" != "$$want" ]; then \
+			echo "an old $(APP_NAME) was relaunched during the install; restarting it"; \
+			kill $$p; sleep 1; open "$(APPS_DIR)/$(APP_NAME).app"; fi; \
+	done
 	@echo "Installed $(APPS_DIR)/$(APP_NAME).app"
 	@echo "CLI: $(BIN_DIR)/forkcast   ·   docs: forkcast help · man forkcast"
 

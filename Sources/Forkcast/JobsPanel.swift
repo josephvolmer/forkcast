@@ -17,7 +17,7 @@ func jobHealth(_ j: JobInfo, staleMinutes: Double) -> Color {
     switch j.state {
     case "stale", "done-error", "killed": return Palette.red
     case "paused": return Palette.blue
-    case "queued", "done-ok", "exited": return .secondary
+    case "queued", "waiting", "done-ok", "exited": return .secondary
     default:
         let limit = j.staleAfterSeconds ?? staleMinutes * 60
         if limit > 0, let s = j.secondsSinceActivity, s > limit / 2 { return Palette.amber }
@@ -99,12 +99,15 @@ struct JobGroupBlock: View {
                     if let t = e.throughputPerHour, t > 0 { Text("\(fmtNum(t))/h").font(.caption.monospacedDigit()).foregroundStyle(.secondary) }
                     Spacer()
                     if let secs = e.etaSeconds, let d = e.etaDate {
-                        Text("ETA \(fmtDuration(secs)) (\(fmtTime(d)))").font(.caption.weight(.semibold).monospacedDigit())
+                        Text(e.etaIsLowerBound
+                             ? "ETA ≥ \(fmtDuration(secs)) (\(fmtTime(d))) · \(e.jobsWithoutETA.count) without ETA"
+                             : "ETA \(fmtDuration(secs)) (\(fmtTime(d)))").font(.caption.weight(.semibold).monospacedDigit())
                             .help("Basis: " + e.basis)
                     } else if e.running + e.queued == 0 {
                         Text("all done").font(.caption).foregroundStyle(.secondary)
                     } else {
-                        Text("ETA unknown").font(.caption).foregroundStyle(.secondary).help(e.basis)
+                        Text(e.jobsWithoutETA.isEmpty ? "ETA unknown" : "ETA unknown · \(e.jobsWithoutETA.count) without total")
+                            .font(.caption).foregroundStyle(.secondary).help(e.basis)
                     }
                 } else { Spacer() }
                 if active || paused {
@@ -145,8 +148,11 @@ struct JobRow: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Dot(color: health)
-                Text(job.name).font(.system(size: 12.5, weight: .semibold)).lineLimit(1)
-                Tag(text: job.state, color: health == .secondary ? .gray : health)
+                Text(job.name + ((job.run ?? 1) > 1 ? " #\(job.run!)" : "")).font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1).truncationMode(.middle).help(job.name)
+                Tag(text: job.displayState, color: health == .secondary ? .gray : health)
+                if let w = job.waitingOn { Text("for \(w)").font(.caption2).foregroundStyle(.secondary) }
+                if job.logMissing == true { Text("log not found").font(.caption2).foregroundStyle(Palette.amber).help(job.log ?? "") }
                 if let n = job.pausedNote { Text(n).font(.caption2).foregroundStyle(Palette.blue) }
                 Spacer(minLength: 4)
                 if !job.isFinished && job.state != "queued" {
@@ -162,6 +168,7 @@ struct JobRow: View {
                 }
                 if let r = job.ratePerHour { Text("\(fmtNum(r))/h") }
                 if let e = job.etaSeconds { Text("ETA \(fmtDuration(e)) (\(fmtTime(Date().addingTimeInterval(e))))").help(job.etaBasis ?? "") }
+                else if !job.isFinished, let b = job.etaBasis { Text("no ETA").foregroundStyle(.secondary).help(b) }
                 if let note = job.note { Text(note).lineLimit(1).foregroundStyle(.secondary) }
                 Spacer(minLength: 4)
                 if let a = job.secondsSinceActivity {

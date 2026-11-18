@@ -12,6 +12,7 @@ struct CPUAlertConfig: Codable {
     var percent = 80.0
     var minutes = 3.0
     var muted: [String] = []     // group / job / label names that are *supposed* to be busy
+    var registeredJobs = false   // also alert on registered jobs (off: they're expected to be busy; use expectedCPU instead)
 }
 
 struct AlertConfig: Codable {
@@ -21,6 +22,7 @@ struct AlertConfig: Codable {
     var batteryLowOnACPct: Double? = 10
     var diskFreeMinGB: Double? = 30
     var diskHoursToFloorMin: Double? = 6
+    var snapshotHold = true                     // deletes in the last hour didn't free space (TM local snapshots hold it)
     var memoryRedMinutes: Double? = 2
     var swapGrowthGBPerHour: Double? = 4
     var throttlingMinutes: Double? = 5

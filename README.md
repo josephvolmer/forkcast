@@ -26,9 +26,9 @@ It was built for people (and agents) who leave renders, analyses, uploads or oth
 - **Resource tiles** with 24-hour sparklines:
   - CPU: P and E cores, thermal state, throttling.
   - Memory: pressure, swap and swap growth.
-  - Disk: free space, trend, time until a floor, purgeable space and Time Machine snapshots.
+  - Disk: free space now (the same figure as `df`), plus macOS' "incl. purgeable" estimate, trend (one-off cleanups are logged as events and left out of the rate), time until a floor, Time Machine local snapshots, and an alert when deleting files doesn't free space because snapshots are holding it.
   - Also external drives, network, disk I/O and watched folders.
-- **Job registry.** Start jobs with `forkcast run`, or register running ones. Progress can come from explicit calls, a log file or heartbeats. You get rates, ETAs, staleness detection, exit codes, queued jobs (`--after`) and per-group ETAs.
+- **Job registry.** Start jobs with `forkcast run`, or register running ones. Progress can come from explicit calls, a log file or heartbeats, and a total or log rule can be added to a running job later. You get rates, ETAs, staleness detection, exit codes, queued jobs (`--after JOB|PID`), a `waiting` state for chained lanes, and per-group ETAs (a lower bound when some jobs have no total). Re-using a name starts a new run; earlier runs stay in its history.
 - **Headroom.** Free cores (p90), memory before pressure, power margin under the charger. A cost card per kind of job, and an estimate of how many more fit, with the bottleneck and a confidence level.
 - **Alerts and guards:**
   - Alerts for the charger being unplugged or under-powered, the battery draining on AC, low disk or time-to-floor, memory pressure, swap growth, throttling, unmounted drives, stale or ended jobs, crash reports, a background job opening a window, and CPU above or below an expected range.
@@ -103,6 +103,8 @@ forkcast run --name batch7 --group renders --log render.log --total 1721 -- ./re
 forkcast run --name batch8 --group renders --after batch7 -- ./render.sh batch8   # queued
 forkcast register --name ghidra --group analysis --pid 4242 --stale 3h
 forkcast progress batch7 412/1721
+forkcast progress batch7 --total 1721           # set a total later, no restart
+forkcast state lane2 waiting --on lane1         # chained lane: not stale, not in cost cards
 forkcast jobs
 forkcast eta                            # per-group ETA, with its basis
 
