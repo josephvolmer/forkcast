@@ -36,7 +36,7 @@ It was built for people (and agents) who leave renders, analyses, uploads or oth
   - Delivery by notification, webhook or shell command.
 - **Timeline and history.** Every plug, sleep, alert, guard action and job event, plus stacked charts on a shared time axis with a crosshair and drag-to-inspect. Kept for 30 days in SQLite and written immediately, so it survives crashes and power loss.
 - **For scripts and agents.** `forkcast wait 'job batch7 done or battery < 15'` replaces polling loops. Every read command takes `--json`. `forkcast help --json` describes the whole CLI.
-- **Light on the machine.** About 0.15% CPU and 20 MB of memory in the background (it samples every 10 s). It samples every 1 s while a window is open.
+- **Light on the machine.** About 0.25% CPU and 25 MB of memory in the background (it samples every 10 s). It samples every 1 s while a window is open.
 
 ## Requirements
 
