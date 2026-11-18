@@ -45,6 +45,20 @@ It was built for people (and agents) who leave renders, analyses, uploads or oth
 
 ## Install
 
+### Download (recommended)
+
+Get **Forkcast-&lt;version&gt;-macos-arm64.pkg** from [Releases](https://github.com/josephvolmer/forkcast/releases/latest) and double-click it. The installer:
+- puts `Forkcast.app` in `/Applications`;
+- links the `forkcast` command into `/usr/local/bin` (already on your `PATH`);
+- links its man page;
+- starts the app.
+
+The local API is part of the app, so there's nothing else to install.
+
+If a release isn't notarized, macOS will say it can't verify the installer. Right-click the `.pkg` and choose **Open**, or use **System Settings › Privacy & Security › Open Anyway**. No admin rights? Use the `.zip` from the same release and run `sh install.sh` from the unzipped folder.
+
+### From source
+
 ```sh
 git clone https://github.com/josephvolmer/forkcast.git
 cd forkcast
@@ -57,6 +71,7 @@ This builds the app, installs it to `/Applications/Forkcast.app`, links the CLI 
 |---|---|
 | `make` | build `./build/Forkcast.app` (regenerates icons from `icon.png` / `fork.png` when they change) |
 | `make install` | install and launch (override with `APPS_DIR=… BIN_DIR=… MAN_DIR=…`) |
+| `make pkg` | build a double-click installer, `build/Forkcast-<version>.pkg` |
 | `make run` | build and open the dashboard without installing |
 | `make check` | build, then smoke-test the CLI and its documentation |
 | `make uninstall` | remove the app, CLI link and man page (keeps your data) |
@@ -197,9 +212,24 @@ Everything stays on your Mac. Forkcast makes no network connections of its own: 
 ## Uninstall
 
 ```sh
-make uninstall                                          # app, CLI link, man page
+make uninstall                                          # if installed from source
+sudo rm -rf /Applications/Forkcast.app /usr/local/bin/forkcast /usr/local/share/man/man1/forkcast.1   # if installed with the .pkg
 rm -rf ~/Library/Application\ Support/Forkcast          # history, settings, API token
 ```
+
+## Releases
+
+Pushing a tag (`git tag v2.1.0 && git push origin v2.1.0`) runs [the release workflow](.github/workflows/release.yml). It builds on an Apple Silicon runner, runs `make check`, and publishes a GitHub Release with the `.pkg`, a `.zip` (app + `install.sh`) and `SHA256SUMS.txt`. It can also be started from the Actions tab; leave the version empty for a test build that isn't published.
+
+Builds are ad-hoc signed by default. To ship Developer ID-signed, notarized builds, add these repository secrets:
+
+| Secret | Contents |
+|---|---|
+| `MACOS_CERTIFICATE_P12_BASE64` | base64 of a .p12 holding your *Developer ID Application* and *Developer ID Installer* certificates |
+| `MACOS_CERTIFICATE_PASSWORD` | the .p12 password |
+| `MACOS_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `MACOS_INSTALLER_IDENTITY` | e.g. `Developer ID Installer: Your Name (TEAMID)` |
+| `NOTARY_APPLE_ID`, `NOTARY_TEAM_ID`, `NOTARY_APP_SPECIFIC_PASSWORD` | credentials for `notarytool` |
 
 ## Project layout
 

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Link the command-line tool and man page (both on the default PATH / MANPATH), then start the app.
+APP="/Applications/Forkcast.app"
+mkdir -p /usr/local/bin /usr/local/share/man/man1
+ln -sf "$APP/Contents/Helpers/forkcast" /usr/local/bin/forkcast
+ln -sf "$APP/Contents/Resources/forkcast.1" /usr/local/share/man/man1/forkcast.1
+
+USER_NAME=$(stat -f %Su /dev/console)
+if [ -n "$USER_NAME" ] && [ "$USER_NAME" != "root" ]; then
+  USER_ID=$(id -u "$USER_NAME")
+  launchctl asuser "$USER_ID" sudo -u "$USER_NAME" open "$APP" >/dev/null 2>&1 || true
+fi
+exit 0

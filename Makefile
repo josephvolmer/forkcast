@@ -8,6 +8,12 @@
 # Override locations:  make install APPS_DIR=~/Applications BIN_DIR=/usr/local/bin MAN_DIR=/usr/local/share/man/man1
 
 APP_NAME  := Forkcast
+# Version: from the latest git tag (v1.2.3 → 1.2.3) unless given, e.g. `make VERSION=2.1.0`.
+VERSION   ?= $(shell git describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || true)
+ifeq ($(strip $(VERSION)),)
+VERSION   := 2.0.0
+endif
+BUILD_NUM ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 1)
 APPS_DIR  ?= /Applications
 BIN_DIR   ?= $(HOME)/.local/bin
 MAN_DIR   ?= $(HOME)/.local/share/man/man1
@@ -21,7 +27,9 @@ SOURCES   := $(shell find Sources -name '*.swift') Package.swift
 ICNS      := Resources/AppIcon.icns
 MENUICON  := Resources/MenuIcon.png Resources/MenuIcon@2x.png
 
-.PHONY: all app build icon menuicon man install uninstall run open clean help check
+FORCE:
+
+.PHONY: all app build icon menuicon man pkg install uninstall run open clean help check
 
 all: app
 
@@ -30,6 +38,7 @@ help:
 	@echo "make install    install to $(APPS_DIR), link $(BIN_DIR)/forkcast and $(MAN_DIR)/forkcast.1, launch"
 	@echo "make uninstall  remove app, CLI link and man page (data in '$(DATA_DIR)' is kept)"
 	@echo "make run        build and open the dashboard from ./build (without installing)"
+	@echo "make pkg        build a double-click installer: build/Forkcast-<version>.pkg (app + CLI + man page)"
 	@echo "make icon       regenerate $(ICNS) from icon.png (menu bar icon: fork.png)"
 	@echo "make man        print the generated man page (roff)"
 	@echo "make check      build, then smoke-test the CLI help"
@@ -67,18 +76,39 @@ Resources/MenuIcon@2x.png: fork.png
 # case-insensitive, so `forkcast` can't sit next to the `Forkcast` executable).
 app: $(APP)/Contents/Info.plist
 
-$(APP)/Contents/Info.plist: $(BUILD_DIR)/Forkcast $(BUILD_DIR)/ForkcastCLI $(ICNS) $(MENUICON) Resources/Info.plist
+$(APP)/Contents/Info.plist: $(BUILD_DIR)/Forkcast $(BUILD_DIR)/ForkcastCLI $(ICNS) $(MENUICON) Resources/Info.plist FORCE
 	@rm -rf $(APP)
 	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Helpers $(APP)/Contents/Resources
 	cp $(BUILD_DIR)/Forkcast $(APP)/Contents/MacOS/Forkcast
 	cp $(BUILD_DIR)/ForkcastCLI $(CLI)
 	cp $(ICNS) $(APP)/Contents/Resources/AppIcon.icns
 	cp $(MENUICON) $(APP)/Contents/Resources/
-	$(CLI) help --man > $(MANPAGE)
 	cp Resources/Info.plist $(APP)/Contents/Info.plist
+	/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(VERSION)" -c "Set :CFBundleVersion $(BUILD_NUM)" $(APP)/Contents/Info.plist
+	$(CLI) help --man > $(MANPAGE)
 	codesign --force --sign - $(CLI)
 	codesign --force --sign - $(APP)
-	@echo "Built $(APP)"
+	@echo "Built $(APP) (version $(VERSION), build $(BUILD_NUM))"
+
+# Installer package: Forkcast.app → /Applications; postinstall links /usr/local/bin/forkcast and the man page.
+# Packages the app as already built (so a Developer ID signature applied beforehand is kept).
+PKG := build/$(APP_NAME)-$(VERSION).pkg
+
+pkg:
+	@test -d $(APP) || $(MAKE) app
+	@rm -rf build/pkgroot build/pkgres build/$(APP_NAME)-component.pkg
+	@mkdir -p build/pkgroot/Applications build/pkgres
+	ditto $(APP) build/pkgroot/Applications/$(APP_NAME).app
+	pkgbuild --analyze --root build/pkgroot build/component.plist >/dev/null
+	plutil -replace 0.BundleIsRelocatable -bool false build/component.plist
+	plutil -replace 0.BundleOverwriteAction -string upgrade build/component.plist
+	pkgbuild --root build/pkgroot --component-plist build/component.plist --scripts pkg/scripts \
+		--identifier local.forkcast --version $(VERSION) --install-location / build/$(APP_NAME)-component.pkg
+	cp pkg/resources/*.html build/pkgres/ && cp LICENSE build/pkgres/LICENSE.txt
+	sed 's/@VERSION@/$(VERSION)/' pkg/distribution.xml > build/distribution.xml
+	productbuild --distribution build/distribution.xml --resources build/pkgres --package-path build $(PKG)
+	@rm -rf build/pkgroot build/pkgres build/component.plist build/$(APP_NAME)-component.pkg build/distribution.xml
+	@echo "Built $(PKG)"
 
 man: build
 	@$(BUILD_DIR)/ForkcastCLI help --man

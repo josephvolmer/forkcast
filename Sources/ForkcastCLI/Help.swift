@@ -3,7 +3,12 @@ import ForkcastCore
 
 // Single source of truth for `forkcast help`, `forkcast <cmd> --help`, `forkcast help --json` and the man page.
 
-let version = "2.0"
+/// Read from the enclosing Forkcast.app's Info.plist (stamped by `make` from the git tag).
+let version: String = {
+    guard let exe = Bundle.main.executableURL?.resolvingSymlinksInPath() else { return "dev" }
+    let plist = exe.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Info.plist")
+    return (NSDictionary(contentsOf: plist)?["CFBundleShortVersionString"] as? String) ?? "dev"
+}()
 
 struct Option: Codable { let flag: String; let help: String }
 

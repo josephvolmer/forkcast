@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and check
+    runs-on: macos-14            # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0         # tags, for the version number
+
+      - name: Toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app || true
+          swift --version
+
+      - name: Build and smoke-test the CLI and docs
+        run: make check

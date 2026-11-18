@@ -1,0 +1,8 @@
+#!/bin/sh
+# Quit a running Forkcast before its files are replaced.
+USER_NAME=$(stat -f %Su /dev/console)
+if [ -n "$USER_NAME" ] && [ "$USER_NAME" != "root" ]; then
+  sudo -u "$USER_NAME" osascript -e 'quit app "Forkcast"' >/dev/null 2>&1 || true
+fi
+pkill -x Forkcast >/dev/null 2>&1 || true
+exit 0

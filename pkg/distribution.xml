@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Forkcast</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="LICENSE.txt"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+    <domains enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="14.0"/>
+        </allowed-os-versions>
+    </volume-check>
+    <choices-outline>
+        <line choice="default">
+            <line choice="local.forkcast"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="local.forkcast" visible="false">
+        <pkg-ref id="local.forkcast"/>
+    </choice>
+    <pkg-ref id="local.forkcast" version="@VERSION@" onConclusion="none">Forkcast-component.pkg</pkg-ref>
+</installer-gui-script>
