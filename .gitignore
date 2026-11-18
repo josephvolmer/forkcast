@@ -1,0 +1,14 @@
+# Build products
+.build/
+build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+
+# Generated from icon.png / fork.png by `make`
+Resources/AppIcon.icns
+Resources/MenuIcon.png
+Resources/MenuIcon@2x.png
+
+# macOS
+.DS_Store
