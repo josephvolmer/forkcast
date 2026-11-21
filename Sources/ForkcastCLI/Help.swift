@@ -123,7 +123,7 @@ let commands: [Command] = [
     Command(name: "register", category: "Jobs",
             synopsis: "forkcast register --name N --pid PID [--group G] [--log FILE] [--regex R] [--total T] [--after JOB] [--json]",
             summary: "Track an already-running process (and every child it spawns) as a job.",
-            details: "Without --pid the job is registered as queued. The exit code of a registered (not `run`) process can't be known; it ends as done-ok if progress reached the total, otherwise as ended (state \"exited\", shown neutrally, not as an alert). A relative --log is resolved against the current directory.",
+            details: "Without --pid the job is registered as queued; start it with `forkcast start NAME` (with or without a pid), or by reporting progress. The exit code of a registered (not `run`) process can't be known; it ends as done-ok if progress reached the total, otherwise as ended (state \"exited\", shown neutrally, not as an alert). A relative --log is resolved against the current directory.",
             options: [Option(flag: "--name N", help: "Job name (required)."), Option(flag: "--pid PID", help: "Root process of the job."),
                       Option(flag: "--group G", help: "Job group (default: default)."), Option(flag: "--log FILE", help: "Log to read progress from."),
                       Option(flag: "--regex R", help: "Progress regex (see `forkcast run --help`)."), Option(flag: "--total T", help: "Total items."),
@@ -133,7 +133,7 @@ let commands: [Command] = [
     Command(name: "progress", category: "Jobs",
             synopsis: "forkcast progress NAME [DONE[/TOTAL]] [--total T] [--log FILE] [--regex R] [--stale DUR] [--note TEXT] [--json]",
             summary: "Report progress for a job, or change how its progress is measured, without restarting it.",
-            details: "DONE is optional: `--total` alone sets or changes the total of a running job, and `--log`/`--regex` attach a log-based progress rule to it (the log is read on the next sample). Pass an empty --log '' or --regex '' to remove one.",
+            details: "For a job with no process (see `forkcast start`), reporting a count starts a queued job, and reaching the total ends it as done-ok. DONE is optional: `--total` alone sets or changes the total of a running job, and `--log`/`--regex` attach a log-based progress rule to it (the log is read on the next sample). Pass an empty --log '' or --regex '' to remove one.",
             options: [Option(flag: "--total T", help: "Set or change the total."),
                       Option(flag: "--log FILE", help: "Read progress and activity from this log from now on."),
                       Option(flag: "--regex R", help: "Progress regex for the log; group 1 = done, group 2 = total."),
@@ -151,10 +151,32 @@ let commands: [Command] = [
             synopsis: "forkcast beat NAME",
             summary: "Heartbeat: the job is alive (no count). Resets its stale timer.",
             examples: ["while work; do forkcast beat sync; done"]),
+    Command(name: "start", category: "Jobs",
+            synopsis: "forkcast start NAME [--pid PID] [--json]",
+            summary: "Mark a queued job as running, with or without a process of its own.",
+            details: """
+            For work that has no long-lived process — an AI agent's task whose commands are short-lived shells, a \
+            manual step — register it without --pid, then `forkcast start NAME` when work begins. A job with no process is \
+            tracked by its progress, heartbeats and log: it can go stale, it has a rate and ETA, and it ends with \
+            `forkcast done NAME`, or by itself (done-ok) when its progress reaches the total. Reporting a count with \
+            `forkcast progress` also starts it. It has no process cost, so it adds nothing to headroom cost cards. \
+            With --pid the job tracks that process tree, as `forkcast register --pid` would. Don't give several jobs the \
+            same pid (for example a shared agent CLI): a process tree belongs to one job.
+            """,
+            options: [Option(flag: "--pid PID", help: "Attach this process as the job's root."), jsonOpt],
+            examples: ["forkcast register --name mod3 --group modules --total 9 --after mod2   # queue it",
+                       "forkcast start mod3   # when work on it begins; then `forkcast progress mod3 4/9` …",
+                       "forkcast start capture --pid 4242"]),
+    Command(name: "done", category: "Jobs",
+            synopsis: "forkcast done NAME [--code N] [--json]",
+            summary: "End a job and record its exit code (0, the default, is done-ok; anything else is done-error).",
+            details: "Use it for jobs that `forkcast run` doesn't end for you: ones started with `forkcast start` and no process, or registered processes whose exit code you know. A job that has already ended is left as it is (exit 0).",
+            options: [Option(flag: "--code N", help: "Exit code to record (default 0)."), jsonOpt],
+            examples: ["forkcast done mod3", "forkcast done mod3 --code 1   # failed"]),
     Command(name: "jobs", category: "Jobs",
             synopsis: "forkcast jobs [--group G] [--json]",
             summary: "Registered jobs: state, progress, rate, ETA, time since last activity, cost and exit code.",
-            details: "States: queued, running, waiting (see `forkcast state`), paused, stale (no progress/log/heartbeat for the job's stale limit — default 15 min, or --stale on run/register), done-ok, done-error, killed, ended (JSON state \"exited\": the process ended and its exit code can't be known). Names are never truncated; #N marks a re-run. The ETA is shown only while the job is progressing (rate > 0); a job without a total has no ETA — set one with `forkcast progress NAME --total N`.",
+            details: "States: queued, running, waiting (see `forkcast state`), paused, stale (no progress/log/heartbeat for the job's stale limit — default 15 min, or --stale on run/register), done-ok, done-error, killed, ended (JSON state \"exited\": the process ended and its exit code can't be known). A job started without a process (`forkcast start`) shows \"no process attached\" instead of its cost. Names are never truncated; #N marks a re-run. The ETA is shown only while the job is progressing (rate > 0); a job without a total has no ETA — set one with `forkcast progress NAME --total N`.",
             options: [Option(flag: "--group G", help: "Only this group."), jsonOpt],
             examples: ["forkcast jobs", "forkcast jobs --group renders --json"]),
     Command(name: "job", category: "Jobs",
@@ -164,7 +186,7 @@ let commands: [Command] = [
     Command(name: "eta", category: "Jobs",
             synopsis: "forkcast eta [GROUP] [--json]",
             summary: "Combined ETA per job group (when the last job finishes), throughput, and the basis of the estimate.",
-            details: "Queued jobs (--after) are included, assuming the group's average per-job rate. When some unfinished jobs have no ETA (no total), the group ETA is a lower bound, shown as \"≥ 7h20m, 3 jobs without ETA\" (JSON: etaIsLowerBound, jobsWithoutETA).",
+            details: "Queued jobs (--after) are included: each starts when its predecessor finishes and runs what is left of its total at the group's average per-job rate (items/h, so give jobs totals in the same unit). A running job without a rate of its own yet uses that average too. When some unfinished jobs have no ETA (no total), the group ETA is a lower bound, shown as \"≥ 7h20m, 3 jobs without ETA\" (JSON: etaIsLowerBound, jobsWithoutETA).",
             options: [jsonOpt], examples: ["forkcast eta", "forkcast eta renders --json"]),
     Command(name: "forget", category: "Jobs",
             synopsis: "forkcast forget NAME",
@@ -271,6 +293,10 @@ let topics: [String: (title: String, body: String)] = [
        Discover everything with `forkcast help --json` (all commands, options, examples, exit codes).
     2. Start long work with `forkcast run --name N --group G [--log F --total T] -- cmd …` so it is tracked by name,
        its exit code is recorded, and progress/ETA work. For something already running: `forkcast register --pid`.
+       Work with no process of its own (a subagent's task, whose commands are short-lived shells under a shared agent
+       CLI): `forkcast register --name N --group G --total T [--after PREV]`, `forkcast start N`, report progress,
+       then `forkcast done N [--code C]` (it also ends by itself when progress reaches the total). Never register
+       the shared agent CLI's pid for it: a process tree belongs to one job.
     3. Never write `until …; do sleep; done` or pgrep loops. Use `forkcast wait 'EXPR' --timeout DUR` and branch on the
        exit code: 0 met, 124 timed out, 2 bad expression, 3 Forkcast not reachable.
     4. Ask "how long until everything is done?" with `forkcast eta --json` (per-group ETA and its basis), or read
@@ -305,7 +331,7 @@ let topics: [String: (title: String, body: String)] = [
     POST /jobs/register           {name, group, pid?, log?, logRegex?, total?, after?, command?, cwd?, staleAfter?}
     POST /jobs/NAME/progress      {done?, total?, note?, log?, logRegex?, cwd?, staleAfter?}  or  {progress: "412/1721"}
     POST /jobs/NAME/state         {state: "waiting"|"running", on?}
-    POST /jobs/NAME/beat          POST /jobs/NAME/exit {code?, signal?, run?}      POST /jobs/NAME/start {pid}
+    POST /jobs/NAME/beat          POST /jobs/NAME/exit {code?, signal?, run?}      POST /jobs/NAME/start {pid?}
     POST /groups/G/pause          POST /groups/G/resume
     POST /guards                  {name, when, forSeconds?, action, group?, resumeWhen?, enabled?}
     DELETE /jobs/NAME             DELETE /guards/NAME

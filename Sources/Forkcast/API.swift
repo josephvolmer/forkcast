@@ -207,7 +207,7 @@ final class APIServer {
             case "exit": ok(try engine.exitJob(name, decode(ExitRequest.self, r.body)), reply)
             case "state": ok(try engine.setJobState(name, decode(StateRequest.self, r.body)), reply)
             case "start":
-                struct S: Codable { var pid: Int32 }
+                struct S: Codable { var pid: Int32? }   // no pid: work without a process of its own
                 ok(try engine.startQueued(name, pid: decode(S.self, r.body).pid), reply)
             default: fail(404, "unknown job action '\(seg[2])'", reply)
             }

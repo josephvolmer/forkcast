@@ -256,10 +256,7 @@ final class Engine {
         // Jobs.
         for e in jobs.update(table: table, groups: groupMap, members: result.members,
                              staleMinutes: cfg.alerts.jobStaleMinutes, now: now) {
-            event(e.type, e.subject, e.message)
-            if cfg.alerts.jobEnded, ["job.finished", "job.failed", "job.exited"].contains(e.type) {
-                deliver(alerts.raise("job_ended", e.subject, e.message, severity: Self.endSeverity(e.type)))
-            }
+            jobEvent(e)
         }
 
         // Sensors.
@@ -892,15 +889,28 @@ final class Engine {
             return info
         }
     }
-    func startQueued(_ name: String, pid: Int32) throws -> JobInfo {
+    func startQueued(_ name: String, pid: Int32?) throws -> JobInfo {
         try sync {
-            if table.entries[pid] == nil { table.sample() }
-            let info = try jobs.start(name, pid: pid, table: table)
-            event("job.started", name, "\(name) started (pid \(pid))")
+            if let pid, table.entries[pid] == nil { table.sample() }
+            let (info, ev) = try jobs.start(name, pid: pid, table: table)
+            if let ev { jobEvent(ev) }
             return info
         }
     }
-    func progress(_ name: String, _ p: ProgressRequest) throws -> JobInfo { try sync { try jobs.progress(name, p) } }
+    func progress(_ name: String, _ p: ProgressRequest) throws -> JobInfo {
+        try sync {
+            let (info, evs) = try jobs.progress(name, p)
+            evs.forEach(jobEvent)
+            return info
+        }
+    }
+    /// Records a job event on the timeline, and raises the job-ended alert for a run that ended.
+    private func jobEvent(_ e: JobEvent) {
+        event(e.type, e.subject, e.message)
+        if configStore.config.alerts.jobEnded, ["job.finished", "job.failed", "job.exited"].contains(e.type) {
+            deliver(alerts.raise("job_ended", e.subject, e.message, severity: Self.endSeverity(e.type)))
+        }
+    }
     func beat(_ name: String) throws -> JobInfo { try sync { try jobs.beat(name) } }
     func exitJob(_ name: String, _ e: ExitRequest) throws -> JobInfo {
         try sync {

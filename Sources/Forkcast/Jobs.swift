@@ -164,7 +164,8 @@ final class JobRegistry {
         return (rec.info, JobEvent(type: "job.registered", subject: name, message: msg))
     }
 
-    func progress(_ name: String, _ p: ProgressRequest) throws -> JobInfo {
+    /// Reporting a count on a queued job with no process starts it; reaching the total ends it (done-ok).
+    func progress(_ name: String, _ p: ProgressRequest) throws -> (JobInfo, [JobEvent]) {
         guard var r = recs[name] else { throw ExprError(message: "unknown job '\(name)'") }
         var done = p.done, total = p.total
         if let s = p.progress, !s.isEmpty {
@@ -197,9 +198,16 @@ final class JobRegistry {
         }
         if let n = p.note { r.info.note = n }
         if done != nil || p.note != nil { r.info.lastActivityAt = now }
+        var events: [JobEvent] = []
+        if done != nil, Self.selfEnding(r), r.info.state == "queued" {
+            r.info.state = "running"
+            r.info.startedAt = r.info.startedAt ?? now
+            events.append(JobEvent(type: "job.started", subject: name, message: "\(name) started (progress reported; no process attached)"))
+        }
+        if let e = completeIfDone(&r, now: now) { events.append(e) }
         recs[name] = r
         persist(name)
-        return r.info
+        return (r.info, events)
     }
 
     func beat(_ name: String) throws -> JobInfo {
@@ -294,18 +302,50 @@ final class JobRegistry {
         return true
     }
 
-    /// Attach a pid to a queued job (used by `forkcast run --after`).
-    func start(_ name: String, pid: Int32, table: ProcessTable) throws -> JobInfo {
-        guard var r = recs[name], let e = table.entries[pid] else { throw ExprError(message: "unknown job or pid") }
-        r.info.pid = pid
-        r.pidStart = e.start
-        r.info.startedAt = Date(timeIntervalSince1970: e.start)
-        r.info.command = r.info.command ?? table.commandLine(pid)
-        r.info.state = "running"
+    /// Mark a queued job as started. With a pid (used by `forkcast run --after`) the job tracks that process tree;
+    /// without one (`forkcast start NAME`, for work that has no process of its own, e.g. an agent's task) it runs
+    /// until `forkcast done`, an exit report, or its progress reaching the total. Returns nil as the event when
+    /// nothing changed (starting a job that is already running without a pid).
+    func start(_ name: String, pid: Int32?, table: ProcessTable) throws -> (JobInfo, JobEvent?) {
+        guard var r = recs[name] else { throw ExprError(message: "unknown job '\(name)'") }
+        guard !r.info.isFinished else { throw ExprError(message: "\(name) has already ended (\(r.info.displayState)); register it again for a new run") }
+        let now = Date()
+        let event: JobEvent?
+        if let pid {
+            guard let e = table.entries[pid] else { throw ExprError(message: "no process with pid \(pid)") }
+            r.info.pid = pid
+            r.pidStart = e.start
+            r.info.startedAt = Date(timeIntervalSince1970: e.start)
+            r.info.command = r.info.command ?? table.commandLine(pid)
+            r.info.state = "running"
+            event = JobEvent(type: "job.started", subject: name, message: "\(name) started (pid \(pid))")
+        } else {
+            if let p = r.info.pid { throw ExprError(message: "\(name) is already running as pid \(p)") }
+            guard r.info.state == "queued" else { return (r.info, nil) }
+            r.info.startedAt = now
+            r.info.state = "running"
+            event = JobEvent(type: "job.started", subject: name, message: "\(name) started (no process attached)")
+        }
         r.info.note = nil
+        r.info.lastActivityAt = now
         recs[name] = r
         persist(name)
-        return r.info
+        return (r.info, event)
+    }
+
+    /// A job with no process that nothing else will end: `forkcast run` reports exit codes for its own jobs.
+    private static func selfEnding(_ r: Rec) -> Bool { r.info.pid == nil && !r.managed }
+
+    /// Ends a job with no process once its progress reaches the total (there is no exit to wait for).
+    private func completeIfDone(_ r: inout Rec, now: Date) -> JobEvent? {
+        guard Self.selfEnding(r), !r.info.isFinished, r.info.state != "queued",
+              let t = r.info.total, t > 0, let d = r.info.done, d >= t else { return nil }
+        r.info.state = "done-ok"
+        r.info.endedAt = now
+        r.info.waitingOn = nil
+        r.info.etaSeconds = nil
+        r.info.secondsSinceActivity = nil
+        return finishEvent(r.info)
     }
 
     func markCrashed(job name: String, pid: Int32, summary: String) -> JobEvent? {
@@ -334,6 +374,33 @@ final class JobRegistry {
 
     // MARK: Per-tick update
 
+    /// Waiting / stale / running for a live job (with or without a process). Returns a job.ready event when
+    /// what it waited for has ended.
+    private func updateActivity(_ r: inout Rec, paused: Bool, staleMinutes: Double, now: Date) -> JobEvent? {
+        var ready: JobEvent?
+        // Waiting for another job or pid: done once that ends.
+        if let on = r.info.waitingOn {
+            let (ended, why) = targetEnded(on)
+            if ended {
+                r.info.waitingOn = nil
+                r.info.lastActivityAt = now
+                ready = JobEvent(type: "job.ready", subject: r.info.name, message: "\(r.info.name) done waiting (\(why))")
+            }
+        }
+        let last = [r.info.lastActivityAt, r.info.lastProgressAt, r.lastBeat, r.info.startedAt]
+            .compactMap { $0 }.max() ?? r.info.registeredAt
+        r.info.secondsSinceActivity = now.timeIntervalSince(last)
+        // A log that doesn't exist (yet) is not evidence of a stall.
+        let logSource = r.info.log != nil && r.info.logMissing != true
+        let hasSource = logSource || r.info.lastProgressAt != nil || r.lastBeat != nil
+        let limit = r.info.staleAfterSeconds ?? staleMinutes * 60   // 0 = never stale
+        if paused { r.info.state = "paused" }
+        else if r.info.waitingOn != nil { r.info.state = "waiting" }
+        else if hasSource && limit > 0 && now.timeIntervalSince(last) > limit { r.info.state = "stale" }
+        else { r.info.state = "running" }
+        return ready
+    }
+
     func update(table: ProcessTable, groups: [String: GroupInfo], members: [String: [Int32]],
                 staleMinutes: Double, now: Date) -> [JobEvent] {
         var events: [JobEvent] = []
@@ -351,11 +418,13 @@ final class JobRegistry {
                 changed = true
             }
             // Progress from the log file.
+            var logAdvanced = false
             if let log = r.info.log {
                 let attrs = try? FileManager.default.attributesOfItem(atPath: log)
                 let missing = attrs == nil
                 if r.info.logMissing != missing { r.info.logMissing = missing; changed = true }
                 if let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970, mtime != r.logMTime {
+                    let firstRead = r.logMTime == nil   // what the log already said, not new progress
                     r.logMTime = mtime
                     r.info.lastActivityAt = max(r.info.lastActivityAt ?? .distantPast, Date(timeIntervalSince1970: mtime))
                     if let (d, t) = Self.progressFromLog(log, regex: r.info.logRegex), d != r.info.done {
@@ -364,9 +433,16 @@ final class JobRegistry {
                         r.info.lastProgressAt = Date(timeIntervalSince1970: mtime)
                         r.points.append([mtime, d])
                         if r.points.count > 400 { r.points.removeFirst(r.points.count - 400) }
+                        logAdvanced = !firstRead
                     }
                     changed = true
                 }
+            }
+            // A queued job with no process whose log moves has started.
+            if logAdvanced, Self.selfEnding(r), r.info.state == "queued" {
+                r.info.state = "running"
+                r.info.startedAt = r.info.startedAt ?? now
+                events.append(JobEvent(type: "job.started", subject: name, message: "\(name) started (its log is moving; no process attached)"))
             }
 
             if !r.info.isFinished, let pid = r.info.pid {
@@ -380,29 +456,11 @@ final class JobRegistry {
                         r.info.cost.memMB = g.memMB
                         r.info.cost.watts = g.watts
                     }
-                    // Waiting for another job or pid: done once that ends.
-                    if let on = r.info.waitingOn {
-                        let (ended, why) = targetEnded(on)
-                        if ended {
-                            r.info.waitingOn = nil
-                            r.info.lastActivityAt = now
-                            events.append(JobEvent(type: "job.ready", subject: name, message: "\(name) done waiting (\(why))"))
-                            changed = true
-                        }
-                    }
-                    let paused = g?.paused ?? false
                     r.info.pausedNote = g?.pausedNote
-                    let last = [r.info.lastActivityAt, r.info.lastProgressAt, r.lastBeat, r.info.startedAt]
-                        .compactMap { $0 }.max() ?? r.info.registeredAt
-                    r.info.secondsSinceActivity = now.timeIntervalSince(last)
-                    // A log that doesn't exist (yet) is not evidence of a stall.
-                    let logSource = r.info.log != nil && r.info.logMissing != true
-                    let hasSource = logSource || r.info.lastProgressAt != nil || r.lastBeat != nil
-                    let limit = r.info.staleAfterSeconds ?? staleMinutes * 60   // 0 = never stale
-                    if paused { r.info.state = "paused" }
-                    else if r.info.waitingOn != nil { r.info.state = "waiting" }
-                    else if hasSource && limit > 0 && now.timeIntervalSince(last) > limit { r.info.state = "stale" }
-                    else { r.info.state = "running" }
+                    if let e = updateActivity(&r, paused: g?.paused ?? false, staleMinutes: staleMinutes, now: now) {
+                        events.append(e)
+                        changed = true
+                    }
                 } else {
                     if r.managed, r.goneSince == nil { r.goneSince = now }
                     // Give `forkcast run` a few seconds to report the exit code.
@@ -414,6 +472,13 @@ final class JobRegistry {
                         r.info.cost = JobCost()
                     }
                 }
+            } else if !r.info.isFinished, r.info.pid == nil, r.info.state != "queued" {
+                // Started without a process (`forkcast start`): progress, heartbeats and its log are the only signals.
+                if let e = updateActivity(&r, paused: false, staleMinutes: staleMinutes, now: now) {
+                    events.append(e)
+                    changed = true
+                }
+                _ = completeIfDone(&r, now: now)   // its finish event is raised below, from the state change
             } else if r.info.state == "queued", let after = r.info.after, let a = recs[after], a.info.isFinished {
                 r.info.note = "waiting to start (\(after) finished)"
             }
@@ -512,6 +577,11 @@ final class JobRegistry {
             if let s = j.etaSeconds {
                 finishAt[j.name] = s
                 basis.append("\(j.name): \(fmtDuration(s)) — \(j.etaBasis ?? "")")
+            } else if j.state == "running", j.ratePerHour == nil, let t = j.total, let r = avgRate, r > 0 {
+                // Just started, no rate of its own yet: what's left at the group's average rate.
+                let left = max(0, t - (j.done ?? 0))
+                finishAt[j.name] = left / r * 3600
+                basis.append("\(j.name): \(fmtDuration(finishAt[j.name]!)) — \(fmtNum(left)) left at the group's average \(fmtNum(r))/h (no rate of its own yet)")
             } else { unknown.append(j.name) }
         }
         for j in js where j.isFinished { finishAt[j.name] = 0 }
@@ -525,8 +595,10 @@ final class JobRegistry {
                 let start: Double? = j.after.map { finishAt[$0] } ?? 0
                 guard let st = start else { continue }
                 if let t = j.total, let r = avgRate, r > 0 {
-                    finishAt[j.name] = st + t / r * 3600
-                    basis.append("\(j.name) (queued after \(j.after ?? "—")): \(fmtDuration(finishAt[j.name]!)) assuming the group's average \(fmtNum(r))/h")
+                    let done = j.done ?? 0
+                    finishAt[j.name] = st + max(0, t - done) / r * 3600
+                    basis.append("\(j.name) (queued after \(j.after ?? "—")\(done > 0 ? ", \(fmtNum(done))/\(fmtNum(t)) done" : "")): "
+                                 + "\(fmtDuration(finishAt[j.name]!)) assuming the group's average \(fmtNum(r))/h")
                 } else { unknown.append(j.name) }
                 pending.remove(at: i)
                 progressed = true

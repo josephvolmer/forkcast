@@ -246,7 +246,9 @@ func printJobs(_ js: [JobInfo]) {
         }
         if let w = j.waitingOn { l += " · waiting for \(w)" }
         if let a = j.secondsSinceActivity { l += " · last activity \(dur(a)) ago" }
-        if !j.isFinished && j.state != "queued" { l += " · \(f0(j.cost.cpuPct))% CPU \(f0(j.cost.memMB)) MB \(f1(j.cost.watts)) W" }
+        if !j.isFinished && j.state != "queued" {
+            l += j.pid == nil ? " · no process attached" : " · \(f0(j.cost.cpuPct))% CPU \(f0(j.cost.memMB)) MB \(f1(j.cost.watts)) W"
+        }
         if let c = j.exitCode { l += " · exit \(c)" }
         if j.logMissing == true { l += " · LOG NOT FOUND" }
         print(l)
@@ -484,6 +486,27 @@ case "state":
 case "beat":
     let name = need(a, 0, "job NAME", cmd)
     _ = Client.load().send("POST", "/jobs/\(path(name))/beat", nil as String?, JobInfo.self)
+
+case "start":
+    let name = need(a, 0, "job NAME", cmd)
+    var pid: Int32?
+    if let s = a.value("--pid") { guard let v = Int32(s) else { die("--pid must be a number", 2) }; pid = v }
+    let (j, data) = Client.load().send("POST", "/jobs/\(path(name))/start", ["pid": pid], JobInfo.self)
+    json ? printJSON(data) : print("\(j.name): \(j.displayState)\(j.pid.map { " (pid \($0))" } ?? " (no process attached)")")
+
+case "done":
+    let name = need(a, 0, "job NAME", cmd)
+    var code: Int32 = 0
+    if let s = a.value("--code") { guard let v = Int32(s) else { die("--code must be a number", 2) }; code = v }
+    let c = Client.load()
+    let (cur, curData) = c.get("/jobs/" + path(name), JobInfo.self)
+    if cur.isFinished {   // already ended (e.g. its progress reached the total): nothing to do
+        json ? printJSON(curData) : print("\(cur.name): already \(cur.displayState)\(cur.exitCode.map { " (exit \($0))" } ?? "") — nothing changed")
+        exit(0)
+    }
+    struct Exit: Encodable { var code: Int32; var run: Int? }
+    let (j, data) = c.send("POST", "/jobs/\(path(name))/exit", Exit(code: code, run: cur.run), JobInfo.self)
+    json ? printJSON(data) : print("\(j.name): \(j.displayState) (exit \(code))")
 
 case "wait":
     let e = need(a, 0, "EXPRESSION (see `forkcast help expressions`)", cmd)

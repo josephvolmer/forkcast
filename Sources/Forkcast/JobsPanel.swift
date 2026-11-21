@@ -155,7 +155,10 @@ struct JobRow: View {
                 if job.logMissing == true { Text("log not found").font(.caption2).foregroundStyle(Palette.amber).help(job.log ?? "") }
                 if let n = job.pausedNote { Text(n).font(.caption2).foregroundStyle(Palette.blue) }
                 Spacer(minLength: 4)
-                if !job.isFinished && job.state != "queued" {
+                if !job.isFinished && job.state != "queued" && job.pid == nil {
+                    Text("no process").font(.caption2).foregroundStyle(.tertiary)
+                        .help("Started with `forkcast start`: tracked by its progress, heartbeats or log, not by a process")
+                } else if !job.isFinished && job.state != "queued" {
                     Text(String(format: "%.1f cores · %@ · %@", job.cost.cpuPct / 100, fmtMem(job.cost.memMB), fmtW(job.cost.watts)))
                         .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                 }
